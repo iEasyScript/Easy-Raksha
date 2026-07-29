@@ -898,7 +898,7 @@ local function conjureArmy(wait)
         type = "Custom",
         condition = canSummonConjures,
         action = function() return summonConjures() end,
-        wait = wait or 4,
+        wait = 4,
         useTicks = true,
         replacementAction = function() return true end
     }
@@ -1023,7 +1023,7 @@ local PHASE2_ROTATION = {
         label = "Adrenaline renewal",
         type = "Inventory",
         condition = function() return API.GetAdrenalineFromInterface() < 100 end,
-        wait = 1,
+        wait = 2,
         useTicks = true
     },
     -- Living Death needs 5 ticks to land, not the GCD — at 2 it cut straight
@@ -1175,7 +1175,7 @@ local PHASE4_ROTATION = {
     },
 
     -- "improvise if not dead"
-    improviseTail()
+{label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
 }
 
 ------------------------------------------
