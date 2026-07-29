@@ -916,6 +916,8 @@ local FIGHT_ROTATION = {
     -- full 3. Death Skulls (4) needs longer than the GCD.
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
+    {label = "Surge", wait = 3, useTicks = true},
+    {label = "Surge", wait = 2, useTicks = true},
 
     -- --- PVME "Inside instance" ---------------------------------------------
     -- Conjure army -> Life transfer -> Command ghost.
@@ -963,14 +965,13 @@ local FIGHT_ROTATION = {
     -- Ruination is NOT cast anywhere in here: it's in BUFFS, so the player
     -- manager turns it on and, crucially, back off after the kill. Casting it
     -- from both places races the activation delay and toggles it off again.
-    {label = "Surge", wait = 1, useTicks = true},
     {label = "Invoke Death", wait = 2, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
 
     -- "Split soul + Vuln bomb under Raksha" — the bomb is thrown at whatever
     -- we're targeting, so acquiring him first is what puts it under him.
     targetRaksha(1),
-    {label = "Split Soul", wait = 1, useTicks = true},
+    {label = "Split Soul", wait = 2, useTicks = true},
     {
         label = "Vulnerability bomb",
         type = "Inventory",
