@@ -262,14 +262,19 @@ Constants.OBJECTS = {
 Constants.ADDS = {
         --- Shadow anima pool — an NPC (confirmed) that spawns during the 33709 bomb
     --- phase and must be killed. All of them need to die, AoE'd down with Threads
-    --- of Fate, while we keep dodging the bombs. See mechanics.clearAnimaPools.
+    --- of Fate, while we keep dodging the bombs. See mechanics.handleAnimaPools.
+    ---
+    --- The ability list itself lives in mechanics.lua (POOL_DPS_ABILITIES) with
+    --- Threads of Fate at the head, so there is no separate `aoeAbility` here
+    --- any more: having the AoE in one place and the rest of the damage in
+    --- another meant that whenever Threads was on cooldown we silently dropped
+    --- back to killing pools one at a time.
     ANIMA_POOL = {
         id = 27354,
         type = 1, -- NPC (confirmed)
         name = "Shadow anima pool",
         action = "Attack",
         range = 60,
-        aoeAbility = "Threads of Fate",
 
         -- Standing in a pool is ~1500 damage PER TICK, and we deliberately move
         -- toward them to kill them — so they have to be a movement hazard too or

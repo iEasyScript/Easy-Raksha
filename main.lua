@@ -692,34 +692,240 @@ end
 -- # ROTATION
 ------------------------------------------
 
--- Necromancy single-target rotation, modelled on Rasial's BIS Equilibrium but
--- stripped of things that don't apply to Raksha: no Undead Slayer or Salve
--- amulet (Raksha is a shadow creature, not undead), and no Rasial-specific
--- positioning. We enter with full adrenaline from the crystal, so we open into
--- the Living Death burst, then fall through to the Improvise loop as adaptive
--- filler (which handles Soul Sap / Touch of Death / Finger / Volley / conjure
--- commands by resource state — but NOT the big cooldowns, which is why those
--- are scripted here).
+-- A straight transcription of the PVME Necromancy Raksha rotation:
+--   https://pvme.io/pvme-guides/rs3-full-boss-guides/raksha/necromancy/
 --
--- IMPORTANT: this MUST be a flat array of steps. RotationManager:load iterates
--- with ipairs, so a {name=, rotation={}} wrapper reads as empty and silently
--- fails to load. Buff ids: 30101 = Necrosis, 30123 = Residual Souls.
+-- Every phase has its own line and gets it in full — a phase transition swaps
+-- the entire rotation out (see PHASE_ROTATIONS), so what runs in phase 2 is
+-- phase 2's line and nothing else. The guide, verbatim, for reading against:
+--
+--   Inside instance
+--     Conjure army -> Life transfer -> Command ghost
+--   Phase 1
+--     Surge + Invoke death -> Command skeleton -> Split soul + Vuln bomb under
+--     Raksha -> tc + Bloat -> Death skulls -> Volley of souls -> Soul sap ->
+--     Divert -> Touch of death -> Soul sap -> Command skeleton
+--   Phase 2
+--     Living death + Adrenaline renewal -> Touch of death -> Death skulls ->
+--     Soul sap -> Finger of death -> Finger of death -> Soul sap -> Basic ->
+--     Basic -> Death skulls -> Basic -> Touch of death -> Basic ->
+--     improvise basics if not phased
+--   Phase 3
+--     Finger of death -> Finger of death -> Basic -> Death skulls -> Bloat ->
+--     Volley of souls -> Threads of fate + target pools -> Soul sap ->
+--     target Raksha + Volley of souls
+--   Phase 4
+--     Anti -> Soul sap -> Touch of death -> Basic -> equip Excalibur -> equip
+--     Soulbound lantern + Conjure army -> Soul sap -> Command skeleton ->
+--     Command ghost -> Death skulls -> Ingenuity + Roar of awakening / Ode to
+--     deceit spec (0 tick) -> Divert -> Soul sap -> Split soul -> Bloat ->
+--     Omniguard spec -> Basic -> Soul sap -> Command skeleton -> Volley of
+--     souls -> Touch of death -> Finger of death -> Deathguard90 EOF spec ->
+--     improvise if not dead
+--
+-- Each line ends on improviseTail(), which is Improvise with `spend = false` —
+-- the guide's "improvise basics if not phased" / "improvise if not dead". The
+-- rotation manager never advances past an Improvise step, so we sit on it until
+-- the phase changes and the next line is loaded.
+--
+-- IMPORTANT: each of these MUST be a flat array of steps. RotationManager:load
+-- iterates with ipairs, so a {name=, rotation={}} wrapper reads as empty and
+-- silently fails to load. Buff ids: 30101 = Necrosis, 30123 = Residual Souls.
 --
 -- Steps whose ability the account hasn't unlocked (e.g. Split Soul) simply fail
 -- and advance — useAbility returns false, the rotation moves on after its wait.
+
+--- Item names for phase 4's weapon switches, in one place because the exact
+--- in-game strings vary with upgrade tier. Every switch step is conditional on
+--- actually carrying the item, so a name that doesn't match costs nothing but
+--- that switch — the rotation flows straight past it.
+local SWITCHES = {
+    excalibur = "Enhanced Excalibur",
+    lantern = "Soulbound lantern",
+    deathguard = "Deathguard",
+    genesisMain = "Roar of Awakening",
+    genesisOff = "Ode to Deceit",
+    omniGuard = "Omni guard",
+    eof = "Essence of Finality"
+}
+
+--- The tail every phase rotation ends on. PVME: "improvise basics if not
+--- phased" / "improvise if not dead", so `spend = false` — Improvise stays on
+--- basics and conjure commands instead of dumping souls, adrenaline and specs
+--- outside the burst windows the guide scripts them into.
+--- @return table
+local function improviseTail()
+    return {
+        label = "Improvise",
+        type = "Improvise",
+        style = "Necromancy",
+        spend = false,
+        wait = 3,
+        useTicks = true
+    }
+end
+
+--- The guide's "tc" / "target Raksha". Clicking him by id rather than pressing
+--- the target-cycle key is unambiguous when pools and adds are on the floor.
+--- @param wait? number
+--- @return table
+local function targetRaksha(wait)
+    return {
+        label = "Target Raksha",
+        type = "Custom",
+        action = function()
+            -- Four args is how every DoAction_NPC call in this codebase is
+            -- written; the arity warning is spurious.
+            ---@diagnostic disable-next-line: missing-parameter
+            return API.DoAction_NPC(0x2a, API.OFF_ACT_AttackNPC_route,
+                                    {Constants.BOSS.id}, 60)
+        end,
+        wait = wait or 1,
+        useTicks = true
+    }
+end
+
+--- Equips an item only when it is actually carried. An account without the
+--- switch skips the step entirely instead of stalling on a failed equip.
+--- @param name string
+--- @param wait? number
+--- @return table
+local function equipIfCarried(name, wait)
+    return {
+        label = "Equip " .. name,
+        type = "Custom",
+        condition = function() return #Inventory:GetItem(name) > 0 end,
+        action = function()
+            Inventory:Equip(name)
+            return true
+        end,
+        wait = wait or 1,
+        useTicks = true,
+        replacementAction = function() return true end
+    }
+end
+
+--- Switches back to the Necromancy weapons after a 0-tick spec switch.
+---
+--- Not in the guide's text, but implied by it: a 0-tick switch is switch-in,
+--- spec, switch-out, and without the switch-out we'd finish the phase wielding
+--- Omni Guard. The weapon we swapped off lands in the inventory, so equipping
+--- the first name we can actually find covers both the T100 shard-of-genesis
+--- pair and the plain deathguard/lantern.
+--- @param wait? number
+--- @return table
+local function restoreNecroWeapons(wait)
+    return {
+        label = "Re-equip Necromancy weapons",
+        type = "Custom",
+        action = function()
+            for _, name in ipairs({SWITCHES.genesisMain, SWITCHES.deathguard}) do
+                if #Inventory:GetItem(name) > 0 then
+                    Inventory:Equip(name)
+                    break
+                end
+            end
+            for _, name in ipairs({SWITCHES.genesisOff, SWITCHES.lantern}) do
+                if #Inventory:GetItem(name) > 0 then
+                    Inventory:Equip(name)
+                    break
+                end
+            end
+            return true
+        end,
+        wait = wait or 0,
+        useTicks = true
+    }
+end
+
+--- Weapon special attack. canSpec() gates on the debuff bar, since the ability
+--- bar does not reflect a special attack's cooldown.
+--- @param wait? number
+--- @return table
+local function weaponSpec(wait)
+    return {
+        label = "Weapon Special Attack",
+        type = "Custom",
+        condition = canSpec,
+        action = function()
+            local used = Utils:useAbility("Weapon Special Attack")
+            if used then markSpecUsed() end
+            return used
+        end,
+        wait = wait or 3,
+        useTicks = true,
+        replacementAction = function() return true end
+    }
+end
+
+--- Finger of Death costs 6 Necrosis. Without them the guide's line would cast
+--- nothing at all, so we fall back to the builder it would have used anyway.
+--- @param wait? number
+--- @return table
+local function fingerOfDeath(wait)
+    return {
+        label = "Finger of Death",
+        condition = function() return Player:getBuff(30101).remaining >= 6 end,
+        replacementLabel = "Touch of Death",
+        wait = wait or 3,
+        useTicks = true
+    }
+end
+
+--- Volley of Souls needs 5 Residual Souls; Soul Sap is the builder to fall back
+--- on when we're short.
+--- @param wait? number
+--- @return table
+local function volleyOfSouls(wait)
+    return {
+        label = "Volley of Souls",
+        condition = function() return Player:getBuff(30123).remaining >= 5 end,
+        replacementLabel = "Soul Sap",
+        wait = wait or 3,
+        useTicks = true
+    }
+end
+
+--- Conjure Undead Army, guarded so we never cast over a summon that's already
+--- landed or still animating. Routed through summonConjures() rather than an
+--- Ability step so the recast lockout is stamped and the mid-fight re-summon in
+--- handleFight can't fire on top of it.
+--- @param wait? number
+--- @return table
+local function conjureArmy(wait)
+    return {
+        label = "Conjure Undead Army",
+        type = "Custom",
+        condition = canSummonConjures,
+        action = function() return summonConjures() end,
+        wait = wait or 4,
+        useTicks = true,
+        replacementAction = function() return true end
+    }
+end
+
 local FIGHT_ROTATION = {
-    -- --- Pre-fight setup: runs on entering the instance, BEFORE Raksha is
-    -- --- engaged (like Rasial). Conjures are already up from the lobby, so we
-    -- --- command them and get Invoke Death / Vengeance up while Surging into
-    -- --- position. None of these need a target.
+    -- --- Pre-fight: script infrastructure, not part of the PVME line --------
+    -- The guide assumes a human has already put these up; nothing in it is
+    -- displaced by them, and they all run before Raksha is engaged so they cost
+    -- no DPS.
+    --
     -- Waits follow Rasial's tuning rather than a blanket GCD: buffs and conjure
     -- commands are effectively off-GCD (0-1), inventory items and equipment
     -- switches are 1, movement is 2-3, and only real damage abilities pay the
-    -- full 3. Living Death (5) and Death Skulls (4) need longer than the GCD.
+    -- full 3. Death Skulls (4) needs longer than the GCD.
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
-    {label = "Surge", wait = 2, useTicks = true},
-    {label = "Surge", wait = 1, useTicks = true},
+
+    -- --- PVME "Inside instance" ---------------------------------------------
+    -- Conjure army -> Life transfer -> Command ghost.
+    --
+    -- The lobby normally summons the army before we walk through the gate, in
+    -- which case conjureArmy() skips straight through — but it stays here so a
+    -- summon that failed in the lobby is still made before the fight starts.
+    conjureArmy(4),
+    {label = "Life Transfer", wait = 2, useTicks = true},
+    {label = "Command Vengeful Ghost", wait = 2, useTicks = true},
     {
         -- Walk to the safespot, once, and record it as HOME for the fight.
         --
@@ -748,96 +954,70 @@ local FIGHT_ROTATION = {
         wait = 2,
         useTicks = true
     },
-    {label = "Command Vengeful Ghost", wait = 3, useTicks = true},
-    {label = "Invoke Lord of Bones", wait = 3, useTicks = true},
+
+    -- --- PVME PHASE 1 -------------------------------------------------------
+    -- Surge + Invoke death -> Command skeleton -> Split soul + Vuln bomb under
+    -- Raksha -> tc + Bloat -> Death skulls -> Volley of souls -> Soul sap ->
+    -- Divert -> Touch of death -> Soul sap -> Command skeleton
+    --
+    -- Ruination is NOT cast anywhere in here: it's in BUFFS, so the player
+    -- manager turns it on and, crucially, back off after the kill. Casting it
+    -- from both places races the activation delay and toggles it off again.
+    {label = "Surge", wait = 1, useTicks = true},
     {label = "Invoke Death", wait = 2, useTicks = true},
-    {label = "Command Skeleton Warrior", wait = 3, useTicks = true},
-    -- Ruination is NOT cast here: it's in BUFFS, so the player manager turns it
-    -- on and, crucially, back off after the kill. Casting it from both places
-    -- races the activation delay and toggles it off again — see BUFFS.
+    {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
+
+    -- "Split soul + Vuln bomb under Raksha" — the bomb is thrown at whatever
+    -- we're targeting, so acquiring him first is what puts it under him.
+    targetRaksha(1),
     {label = "Split Soul", wait = 1, useTicks = true},
-
-    -- --- Engage: acquire Raksha and apply Vulnerability -------------------
     {
-        label = "Attack Raksha",
-        type = "Custom",
-        action = function()
-            -- DoAction_NPC (id-based). Interact:NPC(id, ...) throws a sol type
-            -- error — it expects a name string, not an id.
-            return API.DoAction_NPC(0x2a, API.OFF_ACT_AttackNPC_route,
-                                    {Constants.BOSS.id}, 60)
-        end,
+        label = "Vulnerability bomb",
+        type = "Inventory",
         wait = 1,
-        useTicks = true
+        useTicks = true,
+
+        -- ==== END OF SETUP ================================================
+        -- Everything up to and including this step is buffs, conjures,
+        -- positioning and engaging — none of which Revolution will do for us,
+        -- so it runs in both modes. Everything BELOW is the damage rotation,
+        -- which Revolution replaces. Flagged on the step itself rather than
+        -- matched by label, so re-ordering the pre-fight can't silently move
+        -- the boundary. See SETUP_STEP_COUNT.
+        -- ==================================================================
+        setupBoundary = true
     },
-    {label = "Vulnerability bomb", type = "Inventory", wait = 1, useTicks = true},
 
-    -- ==== END OF SETUP ====================================================
-    -- Everything above is buffs, conjures, positioning and engaging — none of
-    -- which Revolution will do for us, so it runs in both modes. Everything
-    -- BELOW is the damage rotation, which Revolution replaces. See
-    -- SETUP_STEP_COUNT and REVO_ROTATION.
-    -- ======================================================================
-
-    -- --- PHASE 1 (PVME): Bloat -> Death Skulls -> Volley -> Soul Sap ->
-    -- --- Divert -> Touch of Death -> Soul Sap -> Command Skeleton
+    -- "tc + Bloat": re-acquire Raksha, then open the damage.
+    targetRaksha(1),
     {label = "Bloat", wait = 3, useTicks = true},
-    {label = "Death Skulls", wait = 3, useTicks = true},
-    {
-        -- Volley needs 5 Residual Souls (buff 30123). With the War's Retreat
-        -- pre-build we arrive holding 5, so this fires immediately; without it we
-        -- fall back to building with Soul Sap.
-        label = "Volley of Souls",
-        condition = function() return Player:getBuff(30123).remaining >= 5 end,
-        replacementLabel = "Soul Sap",
-        wait = 3,
-        useTicks = true
-    },
+    {label = "Death Skulls", wait = 4, useTicks = true},
+    volleyOfSouls(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Divert", wait = 3, useTicks = true},
-    {
-        -- Omni Guard weapon spec. canSpec() gates on the debuff bar, since the
-        -- ability bar does not reflect the spec cooldown.
-        label = "Weapon Special Attack",
-        type = "Custom",
-        condition = canSpec,
-        action = function()
-            local used = Utils:useAbility("Weapon Special Attack")
-            if used then markSpecUsed() end
-            return used
-        end,
-        wait = 3,
-        useTicks = true,
-        replacementAction = function() return true end
-    },
     {label = "Touch of Death", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
-    {label = "Bloat", wait = 3, useTicks = true},
 
-    -- --- Adaptive filler: loops here forever (index does not advance).
-    -- --- NOTE: Improvise alone never casts Death Skulls / Living Death / Bloat
-    -- --- / Divert, so main.lua layers spendFillerCooldowns() on top of this —
-    -- --- see handleFight. That's where most of our lost damage was.
-    --- Phase 1 runs out into this only if he survives the scripted opener; the
-    --- phase 2 rotation replaces the whole thing on transition.
-    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    -- Phase 1 runs out into this only if he survives the scripted opener; the
+    -- phase 2 rotation replaces the whole thing on transition.
+    improviseTail()
 }
 
 ------------------------------------------
 -- # PHASE 2 ROTATION
 ------------------------------------------
 
---- PVME phase 2: "living death and adrenaline renewal → touch of death → death
---- skulls → soul sap → finger of death → finger of death → soul sap", then
---- alternate basics with Death Skulls and Touch of Death until phased.
----
---- The Essence of Finality spec is folded in after the Finger pair — it isn't in
---- the PVME line-by-line but it's free damage inside the Living Death window and
---- was already sitting here before the split.
+--- PVME phase 2, in full:
+---   Living death + Adrenaline renewal -> Touch of death -> Death skulls ->
+---   Soul sap -> Finger of death -> Finger of death -> Soul sap -> Basic ->
+---   Basic -> Death skulls -> Basic -> Touch of death -> Basic ->
+---   improvise basics if not phased
 local PHASE2_ROTATION = {
-    -- Adrenaline renewal is drunk alongside Living Death rather than saved, and
-    -- it's what funds the Finger of Death pair below.
+    -- "Living death + Adrenaline renewal": drunk in the same beat as the
+    -- ultimate rather than saved, and it's what funds the Finger pair below.
+    -- The drink goes first because it's an inventory action, so the adrenaline
+    -- is already there when Living Death checks for it.
     {
         label = "Adrenaline renewal",
         type = "Inventory",
@@ -852,60 +1032,9 @@ local PHASE2_ROTATION = {
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Soul Sap", wait = 1, useTicks = true}, -- weaves off Death Skulls
-    {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 4,
-        useTicks = true
-    },
-    {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 3,
-        useTicks = true
-    },
+    fingerOfDeath(4),
+    fingerOfDeath(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
-
-    -- --- Essence of Finality (amulet) spec -------------------------------
-    -- Ingenuity of the Humans first so the spec is free. Each step is
-    -- conditional with a replacementAction that just succeeds, so the rotation
-    -- flows straight past when the amulet isn't carried or Death Grasp is
-    -- already applied.
-    {
-        label = "Ingenuity of the Humans",
-        condition = canSpec,
-        wait = 1,
-        useTicks = true
-    },
-    {
-        label = "Equip Essence of Finality",
-        type = "Custom",
-        condition = canSpec,
-        action = function()
-            Inventory:Equip("Essence of Finality")
-            return true
-        end,
-        wait = 1,
-        useTicks = true,
-        replacementAction = function() return true end
-    },
-    {
-        label = "Essence of Finality",
-        type = "Custom",
-        condition = canSpec,
-        action = function()
-            local used = Utils:useAbility("Essence of Finality")
-            if used then markSpecUsed() end
-            return used
-        end,
-        wait = 3,
-        useTicks = true,
-        replacementAction = function() return true end
-    },
-
-    -- "Alternate basics with death skulls and touch of death until phased."
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
@@ -913,130 +1042,123 @@ local PHASE2_ROTATION = {
     {label = "Touch of Death", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
 
-    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    -- "improvise basics if not phased"
+    improviseTail()
 }
 
 ------------------------------------------
 -- # PHASE 3 ROTATION
 ------------------------------------------
 
---- PVME phase 3: "two finger of death casts, then basic → death skulls → bloat →
---- volley of souls → threads of fate (targeting pools) → soul sap", then
---- redirect to Raksha and Volley of Souls again.
+--- PVME phase 3, in full:
+---   Finger of death -> Finger of death -> Basic -> Death skulls -> Bloat ->
+---   Volley of souls -> Threads of fate + target pools -> Soul sap ->
+---   target Raksha + Volley of souls
 ---
---- Note on the pools: this rotation does NOT chase them. Anima pools are handled
---- presence-based by mechanics:handleAnimaPools, which already targets the
---- cluster and leads with Threads of Fate — and it runs earlier in the tick and
---- can take the action outright. Duplicating the targeting here would have the
---- two fighting over which thing we're attacking. The Threads of Fate step below
---- is therefore just the AoE application; what it lands on is whatever the
---- mechanics layer has us targeting at the time.
+--- "Threads of fate + target pools" is the one step that hands control away.
+--- It casts the AoE and then ARMS the pool clear; from the next tick
+--- mechanics:handleAnimaPools owns the target and the abilities, and this
+--- rotation is held (see Mechanics:rotationOnHold) until the last pool is dead.
+--- We resume at the Soul Sap below with Raksha re-acquired. Chasing the pools
+--- from here as well is what had two layers fighting over the target.
 local PHASE3_ROTATION = {
-    {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 3,
-        useTicks = true
-    },
-    {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 3,
-        useTicks = true
-    },
+    fingerOfDeath(3),
+    fingerOfDeath(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Bloat", wait = 3, useTicks = true},
+    volleyOfSouls(3),
     {
-        label = "Volley of Souls",
-        condition = function() return Player:getBuff(30123).remaining >= 5 end,
-        replacementLabel = "Soul Sap",
-        wait = 3,
-        useTicks = true
-    },
-    {
-        label = "Threads of Fate",
-        condition = function()
-            return Utils:canUseAbility("Threads of Fate")
+        label = "Threads of Fate + target pools",
+        type = "Custom",
+        action = function()
+            mechanics:requestPoolClear()
+            return Utils:useAbility("Threads of Fate")
         end,
-        replacementLabel = "Soul Sap",
         wait = 3,
         useTicks = true
     },
     {label = "Soul Sap", wait = 3, useTicks = true},
 
-    -- "Redirect to Raksha" — the pool work above may have pulled our target onto
-    -- the cluster, and the Volley that follows should land on the boss.
-    {
-        label = "Re-target Raksha",
-        type = "Custom",
-        action = function()
-            -- Four args is how every DoAction_NPC call in this codebase is
-            -- written (see Mechanics:attackNpc); the arity warning is spurious.
-            ---@diagnostic disable-next-line: missing-parameter
-            return API.DoAction_NPC(0x2a, API.OFF_ACT_AttackNPC_route,
-                                    {Constants.BOSS.id}, 60)
-        end,
-        wait = 1,
-        useTicks = true,
-        replacementAction = function() return true end
-    },
-    {
-        label = "Volley of Souls",
-        condition = function() return Player:getBuff(30123).remaining >= 5 end,
-        replacementLabel = "Soul Sap",
-        wait = 3,
-        useTicks = true
-    },
+    -- "target Raksha + Volley of souls" — the pool clear leaves us on the
+    -- cluster, and the Volley that follows has to land on the boss.
+    targetRaksha(1),
+    volleyOfSouls(3),
 
-    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    improviseTail()
 }
 
 ------------------------------------------
 -- # PHASE 4 ROTATION
 ------------------------------------------
+--- PVME phase 4, in full:
+---   Anti -> Soul sap -> Touch of death -> Basic -> equip Excalibur -> equip
+---   Soulbound lantern + Conjure army -> Soul sap -> Command skeleton ->
+---   Command ghost -> Death skulls -> Ingenuity + Roar of awakening / Ode to
+---   deceit spec (0 tick) -> Divert -> Soul sap -> Split soul -> Bloat ->
+---   Omniguard spec -> Basic -> Soul sap -> Command skeleton -> Volley of
+---   souls -> Touch of death -> Finger of death -> Deathguard90 EOF spec ->
+---   improvise if not dead
+---
+--- Note what is NOT here: Living Death and the Adrenaline renewal. The guide
+--- spends both in phase 2 and funds phase 4 from the adrenaline carried in plus
+--- the specs, so neither appears in this line.
+---
+--- Every equip is conditional on carrying the item (see SWITCHES), so an
+--- account without a switch flows straight past it rather than stalling.
 local PHASE4_ROTATION = {
-    -- Buy back the bar. Living Death is the whole point of the burst and needs
-    -- 100 adrenaline; this is the drink that previously never happened.
-    {
-        label = "Adrenaline renewal",
-        type = "Inventory",
-        condition = function() return API.GetAdrenalineFromInterface() < 100 end,
-        wait = 1,
-        useTicks = true
-    },
-    -- Living Death needs 5 ticks to land, matching FIGHT_ROTATION's tuning.
-    {label = "Living Death", wait = 5, useTicks = true, condition = function() return API.GetAdrenalineFromInterface() > 99 end},
+    -- "Anti" — Anticipation, off the global cooldown, up before the phase's
+    -- first tail sweep.
+    {label = "Anticipation", wait = 1, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Touch of Death", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+
+    -- "equip Excalibur -> equip Soulbound lantern + Conjure army"
+    equipIfCarried(SWITCHES.excalibur, 1),
+    equipIfCarried(SWITCHES.lantern, 1),
+    conjureArmy(3),
+
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
+    {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
+
+    -- "Ingenuity + Roar of awakening / Ode to deceit spec (0 tick)": Ingenuity
+    -- makes the spec free, both T100 shard-of-genesis weapons go on inside the
+    -- same tick (wait = 0), the spec fires, and we switch back off them.
     {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 4,
-        useTicks = true
-    },
-    {label = "Vulnerability bomb", type = "Inventory", wait = 1, useTicks = true},
-        {
         label = "Ingenuity of the Humans",
         condition = canSpec,
-        wait = 1,
-        useTicks = true
-    },
-    {
-        label = "Equip Essence of Finality",
-        type = "Custom",
-        condition = canSpec,
-        action = function()
-            Inventory:Equip("Essence of Finality")
-            return true
-        end,
         wait = 1,
         useTicks = true,
         replacementAction = function() return true end
     },
+    equipIfCarried(SWITCHES.genesisMain, 0),
+    equipIfCarried(SWITCHES.genesisOff, 0),
+    weaponSpec(2),
+    restoreNecroWeapons(1),
+
+    {label = "Divert", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Split Soul", wait = 3, useTicks = true},
+    {label = "Bloat", wait = 3, useTicks = true},
+
+    -- "Omniguard spec", the same 0-tick shape: switch on, spec, switch back.
+    equipIfCarried(SWITCHES.omniGuard, 0),
+    weaponSpec(2),
+    restoreNecroWeapons(1),
+
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
+    volleyOfSouls(3),
+    {label = "Touch of Death", wait = 3, useTicks = true},
+    fingerOfDeath(3),
+
+    -- "Deathguard90 EOF spec": the Essence of Finality amulet firing the stored
+    -- deathguard special.
+    equipIfCarried(SWITCHES.eof, 1),
     {
         label = "Essence of Finality",
         type = "Custom",
@@ -1050,55 +1172,9 @@ local PHASE4_ROTATION = {
         useTicks = true,
         replacementAction = function() return true end
     },
-    {
-        label = "Finger of Death",
-        condition = function() return Player:getBuff(30101).remaining >= 6 end,
-        replacementLabel = "Touch of Death",
-        wait = 3,
-        useTicks = true
-    },
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    {
-        -- Omni Guard spec. canSpec() gates on the debuff bar, since the ability
-        -- bar does not reflect the spec cooldown.
-        label = "Weapon Special Attack",
-        type = "Custom",
-        condition = canSpec,
-        action = function()
-            local used = Utils:useAbility("Weapon Special Attack")
-            if used then markSpecUsed() end
-            return used
-        end,
-        wait = 3,
-        useTicks = true,
-        replacementAction = function() return true end
-    },
-    {label = "Touch of Death", wait = 3, useTicks = true},
 
-    -- Second top-up, so the Death Skulls recast below isn't cast into an empty
-    -- bar the way it was before. Lower threshold than the opener: we only need
-    -- Death Skulls' 60 here, not Living Death's 100.
-
-    {label = "Death Skulls", wait = 4, useTicks = true},
-    {
-        label = "Volley of Souls",
-        condition = function() return Player:getBuff(30123).remaining >= 5 end,
-        replacementLabel = "Soul Sap",
-        wait = 3,
-        useTicks = true
-    },
-    -- PVME's phase 4 tail: divert -> soul sap -> split soul -> bloat ->
-    -- omniguard spec. Split Soul was missing here; it's a large multiplier on
-    -- everything that follows, so it's worth the global cooldown.
-    {label = "Divert", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    {label = "Split Soul", wait = 3, useTicks = true},
-    {label = "Bloat", wait = 3, useTicks = true},
-    {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
-
-    -- Falls into the same adaptive filler as the main rotation. From here
-    -- spendFillerCooldowns() takes over again for the big cooldowns.
-    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    -- "improvise if not dead"
+    improviseTail()
 }
 
 ------------------------------------------
@@ -1127,17 +1203,18 @@ local PHASE_ROTATIONS = {
 -- defensives.
 --
 -- The setup rotation is the prefix of FIGHT_ROTATION up to the END OF SETUP
--- marker: buffs, conjure commands, Split Soul, the walk to the safespot,
--- engaging Raksha and the Vulnerability bomb. Revolution won't do any of that, so
--- it still runs. There's deliberately no Improvise tail — once setup is done the
--- rotation simply ends and Revolution takes over. (Ruination and the overload are
--- handled by the player manager via BUFFS in both modes, not by the rotation.)
--- Derived rather than hardcoded, so editing the pre-fight can't silently shift
--- the boundary: setup is everything up to and including the engage Vulnerability
--- bomb, which is the last step before the damage rotation begins.
+-- marker: buffs, conjures, the walk to the safespot, Surge/Invoke Death, Split
+-- Soul, the Vulnerability bomb and the target cycle onto Raksha. Revolution
+-- won't do any of that, so it still runs. There's deliberately no Improvise tail
+-- — once setup is done the rotation simply ends and Revolution takes over.
+-- (Ruination and the overload are handled by the player manager via BUFFS in
+-- both modes, not by the rotation.)
+--
+-- Derived from the `setupBoundary` flag rather than a label match, so
+-- re-ordering the pre-fight can't silently move the boundary.
 local SETUP_STEP_COUNT = #FIGHT_ROTATION
 for i, step in ipairs(FIGHT_ROTATION) do
-    if step.label == "Vulnerability bomb" then
+    if step.setupBoundary then
         SETUP_STEP_COUNT = i
         break
     end
@@ -1152,54 +1229,6 @@ local function activeRotation()
     if CONFIG.useRevolution then return REVO_ROTATION end
     return FIGHT_ROTATION
 end
-
-------------------------------------------
--- # FILLER COOLDOWNS
-------------------------------------------
-
--- The single biggest damage problem: the trailing Improvise step is adaptive for
--- Soul Sap / Touch of Death / Finger / Volley / conjure commands, but it NEVER
--- casts the big cooldowns. Death Skulls is our largest hit and comes back up
--- repeatedly during a kill — PVME casts it ~5 times per fight, we were casting
--- it twice and then never again. These are fired on cooldown, highest first,
--- once the scripted rotation has run out.
---- `adren` is the minimum adrenaline the ability needs. Utils:canUseAbility has a
---- special case for Death Skulls that skips the `enabled` check, so without an
---- explicit guard we'd burn ticks clicking it with no adrenaline.
---- `isSpec` entries are gated on the debuff bar via specOnCooldown(), because
---- the ability bar does not reflect a special attack's cooldown — that was the
---- source of the constant spec re-clicking.
-local FILLER_COOLDOWNS = {
-    {name = "Death Skulls", adren = 60}, -- biggest single hit; on cooldown, always
-    {name = "Living Death", adren = 100}, -- ultimate damage window
-    {name = "Weapon Special Attack", adren = 24, isSpec = true},
-    {name = "Split Soul", adren = 0},
-    {name = "Bloat", adren = 0},
-    {name = "Divert", adren = 0},
-    {name = "Command Skeleton Warrior", adren = 0},
-    {name = "Command Vengeful Ghost", adren = 0},
-    {name = "Command Putrid Zombie", adren = 0}
-}
-
---- Casts the highest-priority available filler cooldown.
---- @return boolean cast True if an ability was used (the tick is consumed)
-local function spendFillerCooldowns()
-    local adrenaline = API.GetAdrenalineFromInterface() or 0
-    local specBlocked = specOnCooldown()
-
-    for _, entry in ipairs(FILLER_COOLDOWNS) do
-        local blocked = entry.isSpec and specBlocked
-        if not blocked and adrenaline >= entry.adren and
-            Utils:canUseAbility(entry.name) then
-            if Utils:useAbility(entry.name) then
-                if entry.isSpec then markSpecUsed() end
-                return true
-            end
-        end
-    end
-    return false
-end
-
 
 ------------------------------------------
 -- # PHASE 4 SPECIAL ACTION
@@ -1905,26 +1934,24 @@ function RakshaFight:handleFight()
             end
         end
 
-        if not consumed then
-            -- Once the scripted rotation has run out we sit on the trailing
-            -- Improvise step, which never casts the big cooldowns. Spend those
-            -- first so Death Skulls et al. go out every time they're available.
-            -- Skipped entirely in Revolution mode — the action bar owns damage.
-            --
-            -- Measured against the rotation actually LOADED, not activeRotation():
-            -- phase 4 swaps in PHASE4_ROTATION, which activeRotation() knows
-            -- nothing about. Comparing the index against the wrong table's length
-            -- would either run the filler during the scripted phase 4 burst or
-            -- never run it at all, depending on which table was longer.
-            local loaded = rotationManager.rotation or {}
-            local onFiller = not CONFIG.useRevolution and #loaded > 0 and
-                                 rotationManager.index >= #loaded
+        -- HOLD the rotation while we're off the boss killing something else.
+        --
+        -- Anima pools, the Shadow manifestation and Shadow Energy all pull our
+        -- target away, and the phase rotation is written against Raksha — so
+        -- letting it run during a clear spends Death Skulls, Volley and the
+        -- specs into a pool and then resumes phase 3 several steps further on
+        -- than it should. mechanics owns those fights outright and uses its own
+        -- ability lists (see Mechanics:rotationOnHold); we simply stop here and
+        -- pick up at the same step once it hands the target back.
+        --
+        -- The rotation manager's step timer keeps running while we're held, so
+        -- resuming is immediate rather than paying another full wait.
+        if not consumed and mechanics:rotationOnHold() then consumed = true end
 
-            if not (onFiller and spendFillerCooldowns()) then
-                local ok, err = pcall(function() rotationManager:execute() end)
-                if not ok then
-                    Utils:log("Rotation error: " .. tostring(err), "error")
-                end
+        if not consumed then
+            local ok, err = pcall(function() rotationManager:execute() end)
+            if not ok then
+                Utils:log("Rotation error: " .. tostring(err), "error")
             end
         end
     else

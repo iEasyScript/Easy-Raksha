@@ -69,7 +69,12 @@ function Mechanics.new(options)
         poolsActive = false,
         lastPoolAbilityTick = -99, -- GCD pacing for pool DPS
         lastPoolTargetTick = -99, -- when we last clicked a pool
+        lastPoolSurgeTick = -99, -- when we last surged toward one
         poolTargetId = nil, -- Unique_Id of the pool we're currently killing
+        -- Set by the phase 3 rotation's "Threads of fate + target pools" step.
+        -- Starts a clear regardless of how many are up, since that is the point
+        -- in the guide's line where the pools are meant to be dealt with.
+        poolClearRequested = false,
 
         -- Shadow manifestation (NPC 27355) being killed
         manifestationActive = false,
@@ -258,17 +263,38 @@ end
 -- rather than guessing a single one. Includes 4 for ground-marker objects.
 local FIND_TYPES = {0, 1, 2, 3, 4, 5, 8, 12}
 
--- Abilities to spend on the anima pools, best first. Single-target Necromancy
--- abilities that Threads of Fate spreads to the cluster; Basic Attack is the
--- always-available fallback so we always cast something on them.
--- Ordered by how much of the CLUSTER they hit, not by single-target damage.
--- The wiki's Necromancy picks for pools are Bloat (spreads across a cluster) and
--- Blood Siphon (heals ~700 per pool); we were leading with single-target Touch
--- of Death, which is why clearing them was so slow.
+-- Abilities to spend on the anima pools, best first, and the ONLY things cast
+-- while we're on them — the phase rotation is held for the whole clear (see
+-- Mechanics:rotationOnHold), so this list is the pool fight in its entirety.
+--
+-- Ordered by how much of the CLUSTER each one hits, not by single-target
+-- damage. PVME's phase 3 line is "Threads of fate + target pools -> Soul sap",
+-- so Threads of Fate leads: it hits the target and two more pools at once,
+-- which is the difference between clearing a sweep of eight and killing eight
+-- things one after another.
+--
+-- Volley of Souls is deliberately absent. It's the biggest thing 5 souls can
+-- buy and the guide spends it on Raksha immediately after the pools ("target
+-- Raksha + Volley of souls"), so dumping it into a pool costs more than it
+-- clears.
 local POOL_DPS_ABILITIES = {
-    "Bloat", -- spreads across the cluster
+    "Threads of Fate", -- hits the target plus two more of the cluster
+    "Bloat", -- spreads across the cluster as they die
     "Blood Siphon", -- hits the cluster and heals per pool
-    "Volley of Souls", -- dumps banked souls into the group
+    "Soul Sap", -- builds the souls the guide spends on Raksha next
+    "Touch of Death", "Basic<nbsp>Attack"
+}
+
+-- How close two pools have to be to count as one cluster when choosing which to
+-- attack. Threads of Fate splashes to nearby targets, so we lead on the pool
+-- with the most neighbours inside this radius rather than the merely nearest
+-- one — killing three at a time instead of one.
+local POOL_CLUSTER_RADIUS = 3
+
+-- Abilities to spend on the Shadow manifestation, best first, once it has been
+-- stunned. Same contract as POOL_DPS_ABILITIES: while it's up the phase
+-- rotation is held, so this list is all the damage it takes.
+local MANIFESTATION_DPS_ABILITIES = {
     "Touch of Death", "Soul Sap", "Basic<nbsp>Attack"
 }
 
@@ -291,6 +317,12 @@ local POOL_RECLICK_TICKS = 5
 -- target, so surging on the same tick as the click sends us in whatever
 -- direction we were already pointed.
 local POOL_SURGE_FACE_TICKS = 2
+
+-- Minimum ticks between two surges toward a pool. The ability bar's cooldown is
+-- not enough on its own: it doesn't refresh within the tick, and this handler
+-- runs a dozen-plus times per tick, so without this we'd fire the same Surge
+-- repeatedly and end up across the arena.
+local POOL_SURGE_REPEAT_TICKS = 5
 
 -- Expel is the exception to the one-per-tick rule: Mind Flay orbs dispel on
 -- click instead of resolving like an attack, so clicks don't cancel each other
@@ -605,6 +637,23 @@ function Mechanics:diveToTile(tile)
     return false
 end
 
+--- True while we are off Raksha killing something else, and the phase rotation
+--- must therefore be held.
+---
+--- The phase rotations are written against the boss — Death Skulls, Volley of
+--- Souls, the specs, the phase 4 switches. Firing them at an anima pool or a
+--- manifestation both wastes them and walks the rotation index forward, so a
+--- clear that takes eight seconds used to cost us three or four steps of the
+--- phase as well as the damage. Everything we do to an add is cast from this
+--- module's own lists instead (POOL_DPS_ABILITIES,
+--- MANIFESTATION_DPS_ABILITIES), and the rotation resumes on the same step once
+--- the target comes back.
+--- @return boolean
+function Mechanics:rotationOnHold()
+    return self.state.poolsActive or self.state.manifestationActive or
+               self.state.addsActive
+end
+
 --- True when Raksha is our current target. Escape teleports us away from what
 --- we're attacking, so it only clears the sweep when we're on the boss.
 ---
@@ -697,6 +746,8 @@ function Mechanics:resetFight()
     self.state.addsActive = false
     self.state.poolsActive = false
     self.state.poolTargetId = nil
+    self.state.poolClearRequested = false
+    self.state.lastPoolSurgeTick = -99
     self.state.manifestationActive = false
     self.state.instakillActive = false
     self.state.lethalTarget = nil
@@ -1510,21 +1561,73 @@ end
 -- # ANIMA POOLS (kill fast, presence-based)
 ------------------------------------------
 
+--- Picks the pool that takes the most of the swarm with it.
+---
+--- Nearest-first is the obvious choice and it's the wrong one: Threads of Fate
+--- splashes to nearby targets, so leading on an isolated pool two tiles away
+--- wastes the splash while a knot of four sits five tiles off. Each pool is
+--- scored by how many others sit inside POOL_CLUSTER_RADIUS of it and we take
+--- the densest, breaking ties on distance so we never cross the arena for a
+--- marginally better cluster.
+---
+--- O(n^2) in the pool count, so callers must only use it when they actually
+--- need a new target — not on every pass.
+--- @param pools table[] Live pools, nearest-first ordering not required
+--- @return table|nil
+function Mechanics:pickPoolTarget(pools)
+    local best, bestScore, bestDistance = nil, -1, math.huge
+
+    for _, p in ipairs(pools) do
+        local tile = p.Tile_XYZ
+        local d = p.Distance or 999
+        local score = 0
+
+        if tile then
+            for _, other in ipairs(pools) do
+                local ot = other.Tile_XYZ
+                if ot and other ~= p then
+                    local dx, dy = ot.x - tile.x, ot.y - tile.y
+                    if math.sqrt(dx * dx + dy * dy) <= POOL_CLUSTER_RADIUS then
+                        score = score + 1
+                    end
+                end
+            end
+        end
+
+        if score > bestScore or (score == bestScore and d < bestDistance) then
+            best, bestScore, bestDistance = p, score, d
+        end
+    end
+
+    if best then
+        self:log(string.format("next pool: %d others within %d tiles, %.1f away",
+                               bestScore, POOL_CLUSTER_RADIUS, bestDistance))
+    end
+    return best
+end
+
 --- Shadow anima pools (NPC 27354) heal the boss and there can be ~16 at once, so
 --- they must die fast. This is PRESENCE-based (runs whenever any pool exists) —
 --- not tied to the 33709 animation, which was why they weren't being killed: the
 --- pools linger while the boss isn't mid-animation, so the old animation-gated
 --- handler never ran.
 ---
---- It attacks the nearest detected pool OBJECT DIRECTLY (DoAction_NPC__Direct),
---- which bypasses every id/name/type ambiguity by acting on the exact thing we
---- found. Threads of Fate makes single-target abilities hit the cluster, then we
---- DPS directly. Movement (bomb/shadow dodge) runs first so we stay safe.
+--- It attacks the chosen pool OBJECT DIRECTLY (DoAction_NPC__Direct), which
+--- bypasses every id/name/type ambiguity by acting on the exact thing we found,
+--- and leads with Threads of Fate so each cast takes three pools rather than
+--- one. Movement (bomb/shadow dodge) runs first so we stay safe.
 ---
---- HYSTERESIS: a handful of pools isn't worth breaking DPS for, so we only START
---- clearing once the swarm reaches `killThreshold`. Once started we latch and
---- keep going until ZERO are left — we don't stop the moment the count dips back
---- under the threshold, or we'd leave stragglers healing the boss.
+--- The phase rotation is HELD for the whole clear (see rotationOnHold), so
+--- POOL_DPS_ABILITIES is the entirety of what we cast while we're down here.
+---
+--- START conditions, any one of which is enough:
+---   * the swarm reaches `killThreshold` for the current phase,
+---   * Raksha announces the siphon (siphonImminent), or
+---   * the phase 3 rotation reaches its "target pools" step
+---     (requestPoolClear).
+--- Once started we latch and keep going until ZERO are left — we don't stop the
+--- moment the count dips back under the threshold, or we'd leave stragglers
+--- healing the boss.
 --- @return boolean consumed
 function Mechanics:handleAnimaPools()
     local pool = Constants.ADDS.ANIMA_POOL
@@ -1533,6 +1636,7 @@ function Mechanics:handleAnimaPools()
     -- boss. Clears the latch too, in case we were mid-clear.
     if pool.ignore then
         self.state.poolsActive = false
+        self.state.poolClearRequested = false
         return false
     end
 
@@ -1560,6 +1664,9 @@ function Mechanics:handleAnimaPools()
                          self.state.phase))
             self:reattackBoss()
         end
+        -- A rotation request can't override a math.huge phase either, so drop it
+        -- rather than leaving it armed for the next phase to pick up.
+        self.state.poolClearRequested = false
         return false
     end
 
@@ -1575,10 +1682,20 @@ function Mechanics:handleAnimaPools()
                          self.state.bossLife, skipBelow))
             self:reattackBoss()
         end
+        self.state.poolClearRequested = false
         return false
     end
 
-    local pools = self:findAnyType(pool.id, pool.range or 60)
+    -- LIVE pools only. This filter is the single biggest source of the pause
+    -- after each kill: a pool that has just died keeps appearing in the scan for
+    -- a tick or two with Life at 0, so `current` stayed matched to a corpse and
+    -- we stood there "attacking" it until the POOL_RECLICK_TICKS watchdog
+    -- finally fired. Dropping the dead ones means the very next iteration picks
+    -- the next live pool and clicks it.
+    local pools = {}
+    for _, p in ipairs(self:findAnyType(pool.id, pool.range or 60)) do
+        if (p.Life or 0) > 0 then pools[#pools + 1] = p end
+    end
 
     if #pools == 0 then
         if self.state.poolsActive then
@@ -1587,24 +1704,29 @@ function Mechanics:handleAnimaPools()
             self:log("anima pools cleared (0 left) — back to Raksha")
             self:reattackBoss()
         end
+        self.state.poolClearRequested = false
         return false
     end
 
     -- Below the threshold and not already clearing: ignore them and keep DPSing
-    -- the boss. Only crossing the threshold — or Raksha announcing the siphon —
-    -- starts the clear.
+    -- the boss. Only crossing the threshold — or the phase 3 rotation reaching
+    -- its "target pools" step, or Raksha announcing the siphon — starts a clear.
     if not self.state.poolsActive then
         -- The siphon message overrides the THRESHOLD: every pool he pulls in
         -- heals him 5,000 and stacks his damage buff, so once it's announced
         -- they all have to go regardless of how few are up. It does not override
         -- a math.huge phase — that case already returned above.
         local siphoning = self:siphonImminent()
+        local requested = self.state.poolClearRequested
 
-        if not siphoning and #pools < phaseThreshold then return false end
+        if not requested and not siphoning and #pools < phaseThreshold then
+            return false
+        end
         self:log(string.format(
-                     "anima pools: %d up (phase %d, threshold %d%s) — clearing to zero",
+                     "anima pools: %d up (phase %d, threshold %d%s%s) — clearing to zero",
                      #pools, self.state.phase, phaseThreshold,
-                     siphoning and ", SIPHONING" or ""))
+                     siphoning and ", SIPHONING" or "",
+                     requested and ", ROTATION" or ""))
     end
 
     -- Latch: from here we keep clearing every tick until none are left.
@@ -1614,7 +1736,7 @@ function Mechanics:handleAnimaPools()
     local bombsDef = Constants.MECHANICS[Constants.ANIM.BOMBS]
     if bombsDef then self:dodgeBombs(bombsDef, nil) end
 
-    -- Locate the nearest pool AND the one we're already killing, in one pass.
+    -- The pool we're already killing, and the nearest one as a fallback.
     local nearest, nd = nil, math.huge
     local current = nil
     for _, p in ipairs(pools) do
@@ -1627,30 +1749,45 @@ function Mechanics:handleAnimaPools()
 
     local tick = API.Get_tick()
 
-    -- Stick with the pool we're already on until it's actually gone, then move
+    -- Stick with the pool we're already on until it's actually dead, then move
     -- to the next on the SAME iteration — no pacing window, no confirmation
-    -- step. Waiting a tick after each kill to "check" was most of why clearing a
-    -- swarm felt so slow: with ~16 pools that's 16 wasted ticks of standing
-    -- still, and the check bought us nothing because a dead pool simply stops
-    -- appearing in the scan.
+    -- step. Confirming a kill before moving on bought us nothing (a dead pool
+    -- simply stops passing the Life filter above) and cost a tick per pool,
+    -- which across a sweep of eight is most of the clear.
     --
     -- Equally, we do NOT re-click a pool we're already attacking. Repeated
     -- clicks on the same target cancel the in-flight attack, which looks busy
     -- and deals almost no damage. The staleClick watchdog is the one exception,
     -- so a click that silently failed can't strand us on a pool forever.
-    local target = current or nearest
     local staleClick = (tick - self.state.lastPoolTargetTick) >= POOL_RECLICK_TICKS
-    if target and (not current or staleClick) then
+    local needTarget = (current == nil) or staleClick
+
+    -- Only score the cluster when we actually need a new target. It's O(n^2) in
+    -- the pool count and this runs a dozen-plus times per game tick, so doing it
+    -- unconditionally would burn most of a sweep's CPU re-deciding something we
+    -- aren't allowed to change anyway.
+    local target = current
+    if needTarget then
+        target = self:pickPoolTarget(pools) or nearest
+    end
+
+    if target and needTarget then
         API.DoAction_NPC__Direct(0x2a, API.OFF_ACT_AttackNPC_route, target)
         self.state.poolTargetId = target.Unique_Id
         self.state.lastPoolTargetTick = tick
     end
 
+    -- Approach is measured against the pool we're actually going to hit, not
+    -- the nearest one — the cluster we picked above is the one that has to be in
+    -- range.
+    local approach = target or nearest
+    local ad = (approach and approach.Distance) or math.huge
+
     -- Close a long gap with Dive, but ONLY onto a tile that clears every hazard
     -- — a blind dive into a floor shadow is instant death. Skipped entirely when
     -- Dive/Bladed Dive is on cooldown.
-    if nearest and nd > (pool.diveDistance or 8) and self:canDive() then
-        local tile = nearest.Tile_XYZ
+    if approach and ad > (pool.diveDistance or 8) and self:canDive() then
+        local tile = approach.Tile_XYZ
         local player = Player:getCoords()
         if tile and player then
             local tx, ty = math.floor(tile.x), math.floor(tile.y)
@@ -1659,7 +1796,7 @@ function Mechanics:handleAnimaPools()
                 local dest = WPOINT.new(tx, ty, math.floor(player.z or 0))
                 if self:diveToTile(dest) then
                     self:log(string.format("dived to pool at (%d, %d), %.1f away",
-                                           tx, ty, nd))
+                                           tx, ty, ad))
                     return true
                 end
             else
@@ -1673,25 +1810,30 @@ function Mechanics:handleAnimaPools()
     -- walking.
     --
     -- Surge fires along our CURRENT FACING, and clicking a target does not turn
-    -- us instantly — the rotation plays out over the next tick or two. The
-    -- previous version surged on the SAME iteration as the click, so it launched
-    -- us along whatever direction we happened to be facing beforehand. That is
-    -- why we ended up surging all over the arena instead of at the pool.
+    -- us instantly — the turn plays out over the next tick or two. So we click
+    -- first (above) and only surge once POOL_SURGE_FACE_TICKS have passed and
+    -- we're genuinely pointed at it; surging on the same iteration as the click
+    -- is what used to launch us across the arena in whatever direction we
+    -- happened to already be facing.
     --
-    -- So the approach is four deliberate beats:
-    --   1. Click the pool (handled above) — this starts the turn.
-    --   2. Wait POOL_SURGE_FACE_TICKS for the turn to actually land.
-    --   3. Surge, now genuinely pointed at it.
-    --   4. Clear poolTargetId, which makes the next iteration re-click and
-    --      resume the attack from wherever the surge dropped us.
-    if nearest and nd > (pool.surgeDistance or 6) and self.state.poolTargetId and
+    -- The target is KEPT afterwards. Clearing it forced a re-click on the next
+    -- pass, and that re-click cancelled the attack we'd just started — a wasted
+    -- tick at the end of every approach. Walking on after a surge resumes the
+    -- same attack by itself.
+    --
+    -- lastPoolSurgeTick is what now stops a double-surge. Clearing the target
+    -- used to do that as a side effect; the ability bar's cooldown alone isn't
+    -- enough, because it doesn't update within the same tick and this runs a
+    -- dozen-plus times per tick.
+    if approach and ad > (pool.surgeDistance or 6) and self.state.poolTargetId and
         (tick - self.state.lastPoolTargetTick) >= POOL_SURGE_FACE_TICKS and
+        (tick - self.state.lastPoolSurgeTick) >= POOL_SURGE_REPEAT_TICKS and
         Utils:canUseAbility("Surge") then
+        self.state.lastPoolSurgeTick = tick
         if Utils:useAbility("Surge") then
             self:log(string.format(
                          "surged toward pool %.1f away (faced it for %d ticks)",
-                         nd, tick - self.state.lastPoolTargetTick))
-            self.state.poolTargetId = nil -- beat 4: re-click on the next pass
+                         ad, tick - self.state.lastPoolTargetTick))
             return true
         end
     end
@@ -1706,13 +1848,10 @@ function Mechanics:handleAnimaPools()
         return true -- still own the tick; wait out the GCD
     end
 
-    -- Threads of Fate for the AoE, then DPS the targeted pool directly.
-    if pool.aoeAbility and Utils:canUseAbility(pool.aoeAbility) then
-        self:log(pool.aoeAbility .. " for pool AoE")
-        Utils:useAbility(pool.aoeAbility)
-        self.state.lastPoolAbilityTick = tick
-        return true
-    end
+    -- One ordered list, Threads of Fate first. The old version tried the AoE
+    -- through a separate `aoeAbility` branch and then fell into a second list
+    -- that led with single-target damage, so whenever Threads was on cooldown we
+    -- went back to killing pools one at a time.
     for _, ability in ipairs(POOL_DPS_ABILITIES) do
         if Utils:canUseAbility(ability) then
             self:log("pool DPS: " .. ability)
@@ -1725,15 +1864,32 @@ function Mechanics:handleAnimaPools()
     return true
 end
 
+--- Starts a pool clear from the rotation, regardless of how many are up.
+---
+--- PVME's phase 3 line reaches "Threads of fate + target pools" at a specific
+--- point and expects the pools to be dealt with there, which is a different
+--- trigger from the count threshold and the siphon cue. Cleared automatically
+--- once the last pool dies.
+function Mechanics:requestPoolClear()
+    self.state.poolClearRequested = true
+end
+
 ------------------------------------------
 -- # SHADOW MANIFESTATION (kill fast)
 ------------------------------------------
 
 --- Shadow manifestation (NPC 27355) spawns and must be killed fast. We target
---- it, stun it with Soul Strike, and DPS it down. Soul Strike needs a residual
---- soul (buff 30123); if we have none we Soul Sap it first, which generates one.
---- Casting an ability consumes the tick; on the other ticks we hand off so the
---- rotation fires its remaining abilities on the targeted manifestation.
+--- it, stun it with Soul Strike, and DPS it down with
+--- MANIFESTATION_DPS_ABILITIES. Soul Strike needs a residual soul (buff 30123);
+--- if we have none we Soul Sap it first, which generates one.
+---
+--- This ALWAYS owns the tick while the manifestation is up. It used to return
+--- false once the stun was handled so the phase rotation could add its damage,
+--- and that was the wrong trade: the rotation is written against Raksha, so
+--- letting it run here fed Death Skulls, Volley and the specs into an add and
+--- then resumed the phase several steps further on than it should have. The
+--- rotation is held instead (see Mechanics:rotationOnHold) and picks up exactly
+--- where it left off once the manifestation is dead.
 --- @return boolean consumed
 function Mechanics:handleShadowManifestation()
     local sm = Constants.ADDS.SHADOW_MANIFESTATION
@@ -1754,8 +1910,8 @@ function Mechanics:handleShadowManifestation()
         self:log("Shadow manifestation up — killing fast")
     end
 
-    -- Target it so our abilities (and the rotation's) land on it — once per tick,
-    -- or repeated clicks cancel each other.
+    -- Target it so our abilities land on it — once per tick, or repeated clicks
+    -- cancel each other.
     local tick = API.Get_tick()
     if (tick - self.state.lastManifestAbilityTick) < GCD_TICKS then
         return true -- own the tick while the GCD runs down
@@ -1784,8 +1940,18 @@ function Mechanics:handleShadowManifestation()
         return true
     end
 
-    -- Stun handled / not ready this tick: let the rotation DPS the manifestation.
-    return false
+    -- Stunned (or Soul Strike is on cooldown): keep hitting it ourselves rather
+    -- than handing the tick to a rotation aimed at Raksha.
+    for _, ability in ipairs(MANIFESTATION_DPS_ABILITIES) do
+        if Utils:canUseAbility(ability) then
+            self:log("manifestation DPS: " .. ability)
+            Utils:useAbility(ability)
+            self.state.lastManifestAbilityTick = tick
+            return true
+        end
+    end
+
+    return true
 end
 
 ------------------------------------------
@@ -2121,6 +2287,9 @@ end
 ---   5. Shadow manifestation
 ---   6. Shadow anima pools
 ---   7. The boss (rotation — we return false and the fight loop DPSes)
+--- 5 and 6 own the fight outright while they're running: they cast from their
+--- own ability lists and the fight loop holds the phase rotation for the whole
+--- clear (see rotationOnHold), so nothing aimed at Raksha is spent on an add.
 --- Phase 4 collapses most of this: we hold one tile east of Raksha so bombs and
 --- bombardment never come out, pools are left alone (see killThresholdByPhase),
 --- and the only thing that moves us is escaping the tail sweep — after which
