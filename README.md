@@ -4,8 +4,6 @@ An automated Raksha (normal mode) script for MemoryError, written for **Necroman
 
 Runs the full loop: bank and prebuild at War's Retreat → enter the instance → fight all four phases with prayer flicking and mechanic responses → loot → teleport back → repeat.
 
-> **Status:** working but actively developed. Read [Known limitations](#known-limitations) before your first run, and watch it for a few kills rather than leaving it unattended.
-
 ---
 
 ## Requirements
