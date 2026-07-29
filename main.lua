@@ -886,6 +886,54 @@ local function volleyOfSouls(wait)
     }
 end
 
+--- Ticks to stop the player manager drinking for around an Adrenaline renewal.
+--- Two inventory clicks in the same tick means one of them is thrown away, and
+--- the one we lose is whichever went second.
+local ADREN_RENEWAL_DONT_DRINK = 4
+
+--- Adrenaline renewal, following Rasial's pattern (rasial/presets.lua).
+---
+--- Two things matter here and both were wrong before:
+---
+--- ORDER. Rasial drinks it immediately AFTER Living Death, not before, and
+--- that's the whole point of the guide writing them as one beat ("Living death +
+--- Adrenaline renewal"): Living Death spends the full 100, the renewal refunds
+--- the bar, and the Death Skulls and double Finger of Death that follow are paid
+--- for out of the refund. Drinking first meant that on entering the phase near
+--- capped the `< 100` guard skipped the potion, Living Death then emptied the
+--- bar, and nothing ever refilled it — so the potion went undrunk for the whole
+--- kill and the Fingers fell through to their Touch of Death replacement.
+---
+--- DON'T-DRINK. The player manager drinks prayer potions on its own schedule
+--- out of manageHealth/managePrayer, which runs in the same tick as the
+--- rotation. Rasial pauses it around the renewal; we do the same, but against
+--- the manager we're actually running — Rasial calls
+--- `PlayerManager.new():dontDrink(4)`, which builds a throwaway instance and so
+--- pauses nothing.
+--- @param wait? number
+--- @return table
+local function adrenalineRenewal(wait)
+    return {
+        label = "Adrenaline renewal",
+        type = "Custom",
+        -- Still guarded, so we never burn the potion on a full bar — but by this
+        -- point Living Death has just emptied it, so it passes.
+        condition = function()
+            return API.GetAdrenalineFromInterface() < 100
+        end,
+        action = function()
+            playerManager:dontDrink(ADREN_RENEWAL_DONT_DRINK)
+            -- The same call RotationManager's "Inventory" step type makes; done
+            -- here so the don't-drink pause and the click are one step.
+            return API.DoAction_Inventory3("Adrenaline renewal", 0, 1,
+                                           API.OFF_ACT_GeneralInterface_route)
+        end,
+        wait = wait or 3,
+        useTicks = true,
+        replacementAction = function() return true end
+    }
+end
+
 --- Conjure Undead Army, guarded so we never cast over a summon that's already
 --- landed or still animating. Routed through summonConjures() rather than an
 --- Ability step so the recast lockout is stamped and the mid-fight re-summon in
@@ -951,7 +999,7 @@ local FIGHT_ROTATION = {
             mechanics:setHome(hx, hy, hz)
 
             ---@diagnostic disable-next-line: undefined-global
-            return API.DoAction_WalkerW(WPOINT.new(hx, hy, hz))
+            --return API.DoAction_WalkerW(WPOINT.new(hx, hy, hz))
         end,
         wait = 2,
         useTicks = true
@@ -965,27 +1013,18 @@ local FIGHT_ROTATION = {
     -- Ruination is NOT cast anywhere in here: it's in BUFFS, so the player
     -- manager turns it on and, crucially, back off after the kill. Casting it
     -- from both places races the activation delay and toggles it off again.
-    {label = "Invoke Death", wait = 2, useTicks = true},
+    {label = "Invoke Death", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
 
     -- "Split soul + Vuln bomb under Raksha" — the bomb is thrown at whatever
     -- we're targeting, so acquiring him first is what puts it under him.
     targetRaksha(1),
     {label = "Split Soul", wait = 2, useTicks = true},
-    {
+        {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
         useTicks = true,
-
-        -- ==== END OF SETUP ================================================
-        -- Everything up to and including this step is buffs, conjures,
-        -- positioning and engaging — none of which Revolution will do for us,
-        -- so it runs in both modes. Everything BELOW is the damage rotation,
-        -- which Revolution replaces. Flagged on the step itself rather than
-        -- matched by label, so re-ordering the pre-fight can't silently move
-        -- the boundary. See SETUP_STEP_COUNT.
-        -- ==================================================================
         setupBoundary = true
     },
 
@@ -995,9 +1034,9 @@ local FIGHT_ROTATION = {
     {label = "Death Skulls", wait = 4, useTicks = true},
     volleyOfSouls(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
-    {label = "Divert", wait = 3, useTicks = true},
-    {label = "Touch of Death", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Divert", wait = 4, useTicks = true},
+    {label = "Touch of Death", wait = 4, useTicks = true},
+    {label = "Soul Sap", wait = 5, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
 
     -- Phase 1 runs out into this only if he survives the scripted opener; the
@@ -1015,24 +1054,25 @@ local FIGHT_ROTATION = {
 ---   Basic -> Death skulls -> Basic -> Touch of death -> Basic ->
 ---   improvise basics if not phased
 local PHASE2_ROTATION = {
-    -- "Living death + Adrenaline renewal": drunk in the same beat as the
-    -- ultimate rather than saved, and it's what funds the Finger pair below.
-    -- The drink goes first because it's an inventory action, so the adrenaline
-    -- is already there when Living Death checks for it.
-    {
-        label = "Adrenaline renewal",
-        type = "Inventory",
-        condition = function() return API.GetAdrenalineFromInterface() < 100 end,
-        wait = 2,
-        useTicks = true
-    },
-    -- Living Death needs 5 ticks to land, not the GCD — at 2 it cut straight
-    -- into the following ability.
-    {label = "Living Death", wait = 5, useTicks = true},
+    -- "Living death + Adrenaline renewal", in Rasial's order: the ultimate
+    -- first, the drink straight after it.
+    --
+    -- Living Death costs the whole bar and the renewal hands it straight back,
+    -- which is what pays for the Death Skulls and the Finger pair below — that
+    -- refund IS why the guide writes the two as a single beat. Drinking first
+    -- meant arriving near-capped, failing the "don't waste it" guard, skipping
+    -- the potion, and then having Living Death empty the bar with nothing left
+    -- to refill it.
+    --
+    -- Living Death takes 5 ticks to land before the next ABILITY, but a potion
+    -- is an inventory action and off the global cooldown, so it slots into that
+    -- window rather than extending it: 1 + 4 keeps Touch of Death where it was.
+    {label = "Living Death", wait = 3, useTicks = true},
+    adrenalineRenewal(4),
     {label = "Touch of Death", wait = 3, useTicks = true},
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 1, useTicks = true}, -- weaves off Death Skulls
+    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
     fingerOfDeath(4),
     fingerOfDeath(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
@@ -1086,7 +1126,7 @@ local PHASE3_ROTATION = {
     targetRaksha(1),
     volleyOfSouls(3),
 
-    improviseTail()
+    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
 }
 
 ------------------------------------------
@@ -1123,8 +1163,9 @@ local PHASE4_ROTATION = {
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
     {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
+    adrenalineRenewal(4),
     {label = "Death Skulls", wait = 4, useTicks = true},
-
+    
     -- "Ingenuity + Roar of awakening / Ode to deceit spec (0 tick)": Ingenuity
     -- makes the spec free, both T100 shard-of-genesis weapons go on inside the
     -- same tick (wait = 0), the spec fires, and we switch back off them.
@@ -1175,7 +1216,7 @@ local PHASE4_ROTATION = {
     },
 
     -- "improvise if not dead"
-{label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
 }
 
 ------------------------------------------
