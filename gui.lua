@@ -101,7 +101,92 @@ local DEFAULT_TASK_ORDER = {"ALTAR", "BANK", "CRYSTAL", "PREBUILD", "PORTAL"}
 -- GUI LIBRARY INSTANCE
 --------------------------------------------------------------------------------
 
-local ui = GUILib.new()
+--- Raksha's own palette: violet and shadow, instead of the library's default
+--- gold. The boss is the Shadow Colossus, so the accent, buttons and sliders all
+--- shift to amethyst and the window sits a touch darker and cooler.
+---
+--- Only the keys we actually want to change are listed — GUILib._mergeThemes
+--- fills the rest in from DEFAULT_THEME, so this stays a diff rather than a copy
+--- that would silently drift when the library's defaults change.
+local RAKSHA_THEME = {
+    colors = {
+        accent = {0.72, 0.51, 0.94, 1.0}, -- Amethyst
+        header = {0.96, 0.94, 1.00, 1.0}, -- Faint violet-white
+        label = {0.86, 0.84, 0.92, 1.0},
+        hint = {0.50, 0.48, 0.58, 1.0},
+        separator = {0.42, 0.32, 0.58, 0.55},
+
+        windowBg = {0.07, 0.06, 0.10, 0.97}, -- Deep shadow
+        frameBg = {0.14, 0.12, 0.19, 0.92},
+        frameBgHover = {0.20, 0.17, 0.28, 1.0},
+        frameBgActive = {0.26, 0.22, 0.36, 1.0},
+
+        tab = {0.11, 0.09, 0.15, 1.0},
+        tabHovered = {0.19, 0.15, 0.27, 1.0},
+        tabActive = {0.07, 0.06, 0.10, 1.0},
+
+        button = {0.55, 0.36, 0.82, 0.92},
+        buttonHover = {0.66, 0.46, 0.93, 1.0},
+        buttonActive = {0.45, 0.28, 0.70, 1.0},
+        buttonText = {1.00, 0.98, 1.00, 1.0}, -- Light on violet, unlike gold
+
+        sliderGrab = {0.72, 0.51, 0.94, 1.0},
+        checkMark = {0.72, 0.51, 0.94, 1.0}
+    }
+}
+
+local ui = GUILib.new(RAKSHA_THEME)
+
+--------------------------------------------------------------------------------
+-- DASHBOARD PALETTE
+--------------------------------------------------------------------------------
+
+-- Per-phase colours. Raksha darkens as the fight goes on, so the bar walks from
+-- a pale violet toward deep shadow — the colour alone tells you the phase
+-- without reading a number.
+local PHASE_COLORS = {
+    {0.62, 0.72, 0.98}, -- 1 — cold blue
+    {0.72, 0.51, 0.94}, -- 2 — amethyst
+    {0.85, 0.42, 0.85}, -- 3 — magenta
+    {0.95, 0.30, 0.42} -- 4 — blood red
+}
+
+local PRAYER_COLOR = {0.45, 0.78, 0.98}
+local ADRENALINE_COLOR = {0.98, 0.72, 0.28}
+local DANGER_COLOR = {0.95, 0.30, 0.35}
+local IDLE_COLOR = {0.45, 0.43, 0.52}
+
+--- Rounds to a whole number for %d formatting.
+---
+--- NOT cosmetic. Player:getAdrenaline() returns `state / 10`, so it is a FLOAT —
+--- and string.format("%d", 87.4) throws "bad argument #2 to 'format' (number has
+--- no integer representation)" in Lua 5.3+. That error fired mid-draw, so the
+--- tab's endTab()/endTabBar() never ran and ImGui followed it with a cascade of
+--- "Missing EndTabBar() / PopID() / PopStyleVar()" complaints. One unformatted
+--- float took the whole window down.
+--- @param n number|nil
+--- @return number
+local function whole(n) return math.floor(tonumber(n) or 0) end
+
+--- Colour for a phase number, clamped so an unexpected value can't index nil.
+--- @param phase number|nil
+--- @return number[]
+local function phaseColor(phase)
+    local index = math.max(1, math.min(4, math.floor(phase or 1)))
+    return PHASE_COLORS[index]
+end
+
+--- Draws the four phase pips as a single row. The reached ones take their phase
+--- colour, the rest stay muted — a glanceable "how far in are we".
+--- @param phase number
+local function drawPhasePips(phase)
+    phase = math.max(1, math.min(4, math.floor(phase or 1)))
+    for i = 1, 4 do
+        local label = (i <= phase) and "  ●  " or "  ○  "
+        ui:textColored(label, i <= phase and phaseColor(i) or IDLE_COLOR)
+        if i < 4 then ui:sameLine() end
+    end
+end
 
 ------------------------------------------
 -- # CONFIG FILE MANAGEMENT
@@ -634,37 +719,155 @@ end
 -- RUNTIME TAB: INFO
 --------------------------------------------------------------------------------
 
+--- The live dashboard: everything you'd want at a glance while it runs.
+---
+--- Built around bars rather than numbers on purpose. A row of text tells you the
+--- boss is on 143,204 HP; a violet bar three-quarters drained tells you the same
+--- thing without reading, and the colour tells you the phase at the same time.
+--- The numbers are still there, just as the label on the bar.
 local function drawInfoTab(data)
+    local player = data.player or {}
+    local review = data.review or {}
+
+    ----------------------------------------------------------------
+    -- Status banner
+    ----------------------------------------------------------------
+    -- A full-width bar used purely as a coloured plate for the status text.
+    -- Red while dodging lethal ground, phase-coloured in the fight, muted
+    -- otherwise — so the banner itself signals danger before you read it.
+    local bannerColor = IDLE_COLOR
+    local bannerText = data.status or "Idle"
+
+    if data.dodging then
+        bannerColor = DANGER_COLOR
+        bannerText = "DODGING LETHAL GROUND"
+    elseif data.activeMechanic then
+        bannerColor = phaseColor(data.phase)
+        bannerText = data.activeMechanic
+    elseif data.inFight then
+        bannerColor = phaseColor(data.phase)
+    end
+
+    ui:progressBar(1.0, 26, bannerText, bannerColor)
+    ui:spacing(1)
+
     if ui:beginInfoTable("##rakshainfo", 0.45) then
-        ui:tableRow("Status", data.status or "Unknown")
         ui:tableRow("Location", data.location or "Unknown")
         ui:tableRow("Runtime", API.ScriptRuntimeString())
         ui:endColumns()
     end
 
+    ----------------------------------------------------------------
+    -- Raksha
+    ----------------------------------------------------------------
+    -- Headings pass "" rather than nil deliberately. sectionHeader treats any
+    -- non-nil second argument as a hint line, so "" adds a blank line plus
+    -- spacing(3) beneath the title. Dropping it tightened things up on paper but
+    -- looked worse in the client — the headings ended up crowding the content
+    -- under them — so the breathing room stays.
     ui:separator()
-    ui:sectionHeader("Kills", "")
+    ui:sectionHeader("Raksha", "")
+
+    local boss = data.boss or {}
+    local phase = data.phase or 1
+
+    ui:textColored("Phase " .. tostring(phase), phaseColor(phase))
+    ui:sameLine()
+    drawPhasePips(phase)
+
+    -- Denominator is the highest HP actually observed this fight, not a
+    -- hardcoded max — see Mechanics review.bossMaxSeen for why.
+    local maxHp = math.max(review.bossMaxSeen or 0, boss.health or 0, 1)
+    local hp = math.max(0, boss.health or 0)
+
+    if boss.found then
+        ui:progressBar(math.min(1, hp / maxHp), 22,
+                       string.format("%s / %s", GUILib.formatNumber(whole(hp)),
+                                     GUILib.formatNumber(whole(maxHp))),
+                       phaseColor(phase))
+    else
+        ui:progressBar(0, 22, "not in the arena", IDLE_COLOR)
+    end
+
+    if ui:beginInfoTable("##rakshaboss", 0.45) then
+        ui:tableRow("Animation", tostring(boss.animation or "-"))
+        ui:tableRow("Mechanic", boss.mechanic or "-")
+        ui:endColumns()
+    end
+
+    ----------------------------------------------------------------
+    -- Player vitals
+    ----------------------------------------------------------------
+    ui:separator()
+    ui:sectionHeader("Vitals", "")
+
+    -- progressBar, not labeledProgressBar: the label goes INSIDE the bar so each
+    -- vital is one compact row. labeledProgressBar puts the label above and
+    -- leaves the bar to draw ImGui's own "82%" inside it, which meant two lines
+    -- per vital saying much the same thing twice.
+    local maxPlayerHp = math.max(whole(player.maxHp), 1)
+    local playerHp = whole(player.hp)
+    local hpPercent = (playerHp / maxPlayerHp) * 100
+
+    ui:progressBar(math.min(1, playerHp / maxPlayerHp), 20,
+                   string.format("Health      %d / %d", playerHp, maxPlayerHp),
+                   GUILib.getHealthColor(hpPercent))
+
+    local prayer = whole(player.prayer)
+    ui:progressBar(math.min(1, prayer / 100), 20,
+                   string.format("Prayer      %d%%", prayer), PRAYER_COLOR)
+
+    -- whole() matters most here: getAdrenaline returns state/10, so this is the
+    -- float that was crashing the draw.
+    local maxAdren = math.max(whole(player.maxAdrenaline), 1)
+    local adren = whole(player.adrenaline)
+    ui:progressBar(math.min(1, adren / maxAdren), 20,
+                   string.format("Adrenaline  %d / %d", adren, maxAdren),
+                   ADRENALINE_COLOR)
+
+    ----------------------------------------------------------------
+    -- This fight
+    ----------------------------------------------------------------
+    ui:separator()
+    ui:sectionHeader("This Fight", "")
+
+    if ui:beginInfoTable("##rakshareview", 0.45) then
+        ui:tableRow("Damage taken",
+                    GUILib.formatNumber(whole(review.damageTaken)))
+        ui:tableRow("Biggest hit",
+                    string.format("%s  (%s)",
+                                  GUILib.formatNumber(whole(review.biggestHit)),
+                                  review.biggestHitAnim or "none"))
+        ui:tableRow("Lowest HP", tostring(whole(review.lowestHp)))
+
+        -- Mechanics answered vs seen. Coloured because a miss is the one number
+        -- here that means something is wrong rather than merely interesting.
+        local missed = whole(review.missed)
+        ui:tableRow("Mechanics",
+                    string.format("%d / %d answered", whole(review.answered),
+                                  whole(review.seen)),
+                    missed > 0 and DANGER_COLOR or nil)
+        if missed > 0 then
+            ui:tableRow("Missed", tostring(missed), DANGER_COLOR)
+        end
+        ui:endColumns()
+    end
+
+    ----------------------------------------------------------------
+    -- Session
+    ----------------------------------------------------------------
+    ui:separator()
+    ui:sectionHeader("Session", "")
 
     if ui:beginInfoTable("##rakshakills", 0.45) then
-        ui:tableRow("Total Kills", tostring(data.killCount or 0))
+        ui:tableRow("Total Kills", tostring(whole(data.killCount)))
         ui:tableRow("Kills / hr", tostring(data.killsPerHour or "0"))
-        ui:tableRow("Deaths", tostring(data.deathCount or 0))
+        ui:tableRow("Deaths", tostring(whole(data.deathCount)),
+                    whole(data.deathCount) > 0 and DANGER_COLOR or nil)
         ui:tableRow("Fastest", data.fastestKill or "N/A")
         ui:tableRow("Slowest", data.slowestKill or "N/A")
         ui:tableRow("Average", data.averageKill or "N/A")
         ui:endColumns()
-    end
-
-    if data.boss then
-        ui:separator()
-        ui:sectionHeader("Raksha", "")
-        if ui:beginInfoTable("##rakshaboss", 0.45) then
-            ui:tableRow("Found", tostring(data.boss.found))
-            ui:tableRow("Health", tostring(data.boss.health))
-            ui:tableRow("Animation", tostring(data.boss.animation))
-            ui:tableRow("Mechanic", data.boss.mechanic or "-")
-            ui:endColumns()
-        end
     end
 end
 
@@ -743,21 +946,40 @@ local function drawConfigContent(gui)
     if ui:buttonSecondary("Cancel##cancel") then gui.cancelled = true end
 end
 
+--- Runs a tab's body so that an error inside it cannot escape the tab.
+---
+--- ImGui's begin/end calls have to balance. When the dashboard threw a
+--- string.format error mid-draw, endTab() and endTabBar() were skipped and ImGui
+--- reported a cascade of "Missing EndTabBar() / PopID() / PopStyleVar()" on top
+--- of the real error — which buried the actual cause and left the window broken
+--- until restart. Catching here means a bad value shows up as one readable line
+--- in its own tab and everything else keeps rendering.
+--- @param fn function
+--- @param ... any
+local function safeDraw(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        ui:statusText("Draw error: " .. tostring(err), "error", true)
+    end
+end
+
 local function drawRuntimeContent(data, gui)
     if ui:beginTabBar("##runtimetabs") then
         local infoFlags = gui.selectInfoTab and ImGuiTabItemFlags.SetSelected or
                               0
         gui.selectInfoTab = false
-        if ui:beginTab("Info###info", infoFlags) then
+        -- The ###info id is kept so selectInfoTab still targets this tab; only
+        -- the visible label changed.
+        if ui:beginTab("Dashboard###info", infoFlags) then
             ui:spacing(1)
-            drawInfoTab(data)
+            safeDraw(drawInfoTab, data)
             ui:endTab()
         end
 
         if gui.config.debugMechanics and
             ui:beginTab("Mechanics###mechdebug") then
             ui:spacing(1)
-            drawMechanicsDebugTab(data)
+            safeDraw(drawMechanicsDebugTab, data)
             ui:endTab()
         end
 
@@ -768,7 +990,7 @@ local function drawRuntimeContent(data, gui)
             if ui:beginTab(label, flags) then
                 gui.selectWarningsTab = false
                 ui:spacing(1)
-                drawWarningsTab(gui)
+                safeDraw(drawWarningsTab, gui)
                 ui:endTab()
             end
         end

@@ -2306,6 +2306,7 @@ local function buildGUIData()
     return {
         status = timer:getStatus(),
         location = location,
+        inFight = RakshaFight:atLocation(),
         killCount = Common.killCount,
         killsPerHour = Utils:valuePerHour(Common.killCount,
                                           Common.scriptStartTime),
@@ -2319,6 +2320,23 @@ local function buildGUIData()
             animation = boss.animation,
             mechanic = Constants.ANIM_NAMES[boss.animation] or "-"
         },
+
+        -- Dashboard extras. Read here rather than inside the GUI so the draw
+        -- callback stays a pure renderer — it runs on ImGui's thread and should
+        -- not be reaching into game memory itself.
+        phase = mechanics.state.phase,
+        activeMechanic = mechanics.state.activeDef and
+            mechanics.state.activeDef.name or nil,
+        dodging = mechanics.state.instakillActive,
+        player = {
+            hp = Player:getHP(),
+            maxHp = Player:getMaxHP(),
+            prayer = Player:getPrayerPercent(),
+            adrenaline = Player:getAdrenaline(),
+            maxAdrenaline = Player:getMaxAdrenaline()
+        },
+        review = mechanics:reviewSnapshot(),
+
         mechanics = mechanics:tracking()
     }
 end

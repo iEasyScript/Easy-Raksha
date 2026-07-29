@@ -125,7 +125,14 @@ function Mechanics.new(options)
             biggestHitAnim = "none",
             lastHp = -1,
             lowestHp = -1,
-            lastSampleTick = -1 -- so HP is sampled once per tick, not per call
+            lastSampleTick = -1, -- so HP is sampled once per tick, not per call
+
+            -- Highest boss HP seen this fight, as the denominator for the GUI's
+            -- health bar. Self-calibrating on purpose: Raksha's true max is
+            -- listed as unconfirmed in Constants.PENDING, and watching the
+            -- actual reads is more honest than hardcoding a number from the
+            -- wiki that might be wrong.
+            bossMaxSeen = 0
         }
     }
 
@@ -191,6 +198,30 @@ function Mechanics:sampleHealth(animName)
 
     if hp < review.lowestHp then review.lowestHp = hp end
     review.lastHp = hp
+end
+
+--- Live snapshot of the review counters, for the GUI dashboard.
+---
+--- Separate from fightReview() because that formats strings for the kill log,
+--- whereas the dashboard wants raw numbers it can colour and lay out itself.
+--- @return table {damageTaken, biggestHit, biggestHitAnim, lowestHp, seen, answered, missed, bossMaxSeen}
+function Mechanics:reviewSnapshot()
+    local review = self.state.review
+
+    local seen, answered = 0, 0
+    for _, count in pairs(review.seen) do seen = seen + count end
+    for _, count in pairs(review.answered) do answered = answered + count end
+
+    return {
+        damageTaken = review.damageTaken or 0,
+        biggestHit = review.biggestHit or 0,
+        biggestHitAnim = review.biggestHitAnim or "none",
+        lowestHp = review.lowestHp or -1,
+        seen = seen,
+        answered = answered,
+        missed = math.max(0, seen - answered),
+        bossMaxSeen = review.bossMaxSeen or 0
+    }
 end
 
 --- Human-readable summary of the fight just finished, for the kill log.
@@ -687,7 +718,8 @@ function Mechanics:resetFight()
         biggestHitAnim = "none",
         lastHp = -1,
         lowestHp = -1,
-        lastSampleTick = -1
+        lastSampleTick = -1,
+        bossMaxSeen = 0
     }
 
     self:clearHome()
@@ -2119,6 +2151,11 @@ function Mechanics:update()
 
     if boss.found then
         self.state.bossLife = boss.life
+
+        -- Track the highest reading for the GUI health bar's denominator.
+        if boss.life > (self.state.review.bossMaxSeen or 0) then
+            self.state.review.bossMaxSeen = boss.life
+        end
 
         -- Phases only ever move FORWARD. Entering phase 4 heals Raksha back to
         -- 400k, which on HP alone reads as phase 3 again — latching stops us
