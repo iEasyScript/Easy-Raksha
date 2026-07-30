@@ -416,6 +416,21 @@ Constants.PRAYER_FLICKER = {
 -- # MECHANIC DEFINITIONS
 ------------------------------------------
 
+--- Tiles from Raksha we have to reach to be clear of the tail sweep, used by
+--- both `escapeSweepWhenNotTargeting` and `walkFromBossWhenNotTargeting` so the
+--- two routes can never disagree about what "out of it" means.
+---
+--- The sweep is a 7x7 centred on Raksha, so +/-3 tiles — but every distance here
+--- is measured against his REPORTED tile (Tile_XYZ), and for a 5x5 NPC it is not
+--- certain whether that is his centre or a corner. The rest of this file assumes
+--- centre (PHASE4.homeOffsetX of 4 is described as "2 tiles off the edge of his
+--- blocked 5x5", which only works from the centre), and on that reading 5 would
+--- do. This is 7 because the cost of being wrong is asymmetric: two extra tiles
+--- costs nothing — Necromancy reaches ~10, so we stay in range of the add we
+--- were killing — while being two tiles short means eating a sweep that also
+--- disables prayers. Tune down if the logs show us clearing it comfortably.
+Constants.TAIL_SWEEP_CLEARANCE = 7
+
 --- How the fight loop should respond to each mechanic animation.
 ---
 --- kind:
@@ -452,7 +467,7 @@ Constants.MECHANICS = {
             -- costs no global cooldown, so it doesn't interrupt the add.
             {
                 ability = "Escape",
-                walkFromBossWhenNotTargeting = 5,
+                walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
                 delayWhenNotTargeting = 2,
                 wait = 2
             },
@@ -462,17 +477,15 @@ Constants.MECHANICS = {
         exclusive = true,
         useTicks = true,
 
-        -- On the Shadow manifestation when this starts: DIVE onto it instead,
-        -- immediately, before the sequence above runs at all. The value is the
-        -- clearance from Raksha the add has to have for the dive to be worth
-        -- taking, and it matches walkFromBossWhenNotTargeting so both routes
-        -- agree on what counts as "out of the sweep".
+        -- Not on Raksha when this starts (killing the manifestation, clearing
+        -- pools): get out of the 7x7 immediately, by Dive, then tile-targeted
+        -- Surge, then walking. See Mechanics:escapeSweep.
         --
-        -- Handled in Mechanics:runActive rather than as a step because the whole
-        -- point is skipping the 2 tick pre-delay: walking out of a 7x7 after a
-        -- hold loses the race with the animation, which is how we kept eating
-        -- sweeps while killing the add.
-        diveToAddWhenNotTargeting = 5
+        -- Handled in Mechanics:runActive rather than as a step, and retried
+        -- every tick, because the whole point is skipping the 2 tick pre-delay
+        -- above: waiting it out and then WALKING loses the race with the
+        -- animation, which is why we kept eating sweeps while on the add.
+        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
         -- retriggerAfter = 0
     },
 
@@ -488,7 +501,7 @@ Constants.MECHANICS = {
             {ability = "Anticipation", waitMs = 2000},
             -- Same reasoning as the other sweep: Surge follows our facing, so
             -- while we're on an add it won't clear a sweep centred on Raksha.
-            {ability = "Surge", walkFromBossWhenNotTargeting = 5, wait = 2},
+            {ability = "Surge", walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE, wait = 2},
             {attackBoss = true}
         },
         priority = 50,
@@ -497,9 +510,10 @@ Constants.MECHANICS = {
 
         -- See the note on the other sweep. It matters more here: this variant
         -- holds on Anticipation for a full 2000ms before it moves us at all, so
-        -- while we're on the manifestation that was two seconds of standing in
-        -- the 7x7. The dive jumps straight past it.
-        diveToAddWhenNotTargeting = 5
+        -- while we were on the manifestation that was two seconds of standing in
+        -- the 7x7 before we even started walking out. escapeSweep jumps straight
+        -- past it.
+        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
     },
 
     [Constants.ANIM.INSTAKILL_BIND] = {
@@ -584,13 +598,13 @@ Constants.MECHANICS_BY_PHASE = {
                 -- Anticipation first: it prevents the stun and prayer-disable,
                 -- and it is off the global cooldown so it costs us no damage.
                 {ability = "Anticipation", wait = 1},
-                {ability = "Escape", walkFromBossWhenNotTargeting = 5, wait = 2},
+                {ability = "Escape", walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE, wait = 2},
                 {attackBoss = true}
             },
             priority = 60,
             exclusive = true,
             retriggerAfter = 5,
-            diveToAddWhenNotTargeting = 5
+            escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
         },
 
         -- The detonation dome. If the bar above Raksha fills it is an instant

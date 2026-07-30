@@ -51,9 +51,6 @@ function Mechanics.new(options)
         stepTick = 0, -- tick the current step fired, for its `wait`
         stepTimeMs = 0, -- os.clock ms it fired, for real-time `waitMs`
         stepArrivedTick = nil, -- tick we reached the step, for any pre-delay
-        -- One dive-to-the-add attempt per mechanic, so a Dive on cooldown can't
-        -- turn into a click every iteration. See runActive.
-        addDiveDone = false,
 
         -- Presence-based adds (Shadow Energy)
         addsActive = false,
@@ -606,6 +603,12 @@ local HOME_HURRY_DISTANCE = 3
 -- above HOME_HURRY_DISTANCE so short corrections never burn the cooldown.
 local HOME_DIVE_DISTANCE = 6
 
+-- Error range handed to API.DoAction_Surge_Tile when escaping a tail sweep: how
+-- far off the requested tile the surge may land and still be worth taking. Surge
+-- travels a fixed distance, so demanding an exact tile would reject nearly every
+-- useful surge; two tiles of slack still lands us outside the 7x7.
+local SWEEP_SURGE_ERROR = 2
+
 --- Ring offsets in a fixed rotational order, cached per radius.
 ---
 --- Built with cos/sin once at first use. Slots are matched to tiles by DISTANCE
@@ -1054,75 +1057,155 @@ function Mechanics:walkAvoiding(x, y, hazards, urgent)
     return true
 end
 
---- Dives to the Shadow manifestation to clear a tail sweep.
+--- The live Shadow manifestation, if one is up. Used to bias the sweep escape
+--- toward a tile that keeps us on the add.
+--- @return table|nil
+function Mechanics:liveManifestation()
+    local sm = Constants.ADDS.SHADOW_MANIFESTATION
+    for _, m in ipairs(self:findAnyType(sm.id, sm.range)) do
+        if (m.Life or 0) > 0 and m.Tile_XYZ then return m end
+    end
+    return nil
+end
+
+--- Best tile to escape a tail sweep to: outside the 7x7, safe to stand on,
+--- reachable without crossing something lethal, and — as a tie-break only — as
+--- close to the Shadow manifestation as we can get so we keep DPSing it.
 ---
---- This is the fast answer to "a sweep started and we're on the add". The sweep
---- is a 7x7 centred on Raksha and the manifestation spawns away from him, so
---- beside the add is both outside the sweep AND where we want to be anyway —
---- one movement does the escape and keeps us on the kill.
----
---- It has to be a Dive. Escape moves away from our TARGET, which while we're on
---- the manifestation is the manifestation and not Raksha, so it can throw us
---- deeper into the sweep. Surge follows our facing, same problem. Walking goes
---- the right way but loses the race with the animation, which is what we were
---- doing and why we kept eating it. Dive is instant and takes a destination.
---- @param clearance number Tiles from Raksha the destination must be
---- @return boolean dived
-function Mechanics:diveToManifestation(clearance)
+--- Getting out comes first and the add comes second, deliberately. The previous
+--- version had it the other way round: it aimed at the manifestation and gave up
+--- entirely if the add happened to be inside the sweep radius, which is exactly
+--- when we most needed to move.
+--- @param clearance number Tiles from Raksha the tile must be
+--- @param hazards table[] Ground hazards, with the sweep already added
+--- @return table|nil {x, y}
+function Mechanics:pickSweepEscapeTile(clearance, hazards)
     local center = self.state.arenaCenterBoss
     local player = Player:getCoords()
-    if not center or not player then return false end
-    if not self:canDive() then return false end
+    if not center or not player then return nil end
 
-    local sm = Constants.ADDS.SHADOW_MANIFESTATION
     local cx, cy = math.floor(center.x), math.floor(center.y)
-    local hazards = self:getAllHazardTiles()
+    local arenaCenter = self.state.arenaCenter
+    local arenaRadius = self:arenaRadius()
 
-    for _, m in ipairs(self:findAnyType(sm.id, sm.range)) do
-        local tile = m.Tile_XYZ
-        if (m.Life or 0) > 0 and tile then
-            local mx, my = math.floor(tile.x), math.floor(tile.y)
+    -- Bias target: the add if there is one, otherwise our own tile, which makes
+    -- the tie-break "move as little as possible".
+    local add = self:liveManifestation()
+    local bx = add and math.floor(add.Tile_XYZ.x) or math.floor(player.x)
+    local by = add and math.floor(add.Tile_XYZ.y) or math.floor(player.y)
 
-            -- Unit vector from Raksha toward the add, so "further out" is a
-            -- direction we can step along.
-            local vx, vy = mx - cx, my - cy
-            local length = math.sqrt(vx * vx + vy * vy)
+    local searchRadius = 12
+    local best, bestCost, bestBias = nil, math.huge, math.huge
 
-            if length > 0 then
-                vx, vy = vx / length, vy / length
+    for dx = -searchRadius, searchRadius do
+        for dy = -searchRadius, searchRadius do
+            local tx = math.floor(player.x + dx)
+            local ty = math.floor(player.y + dy)
 
-                -- Aim NEXT TO the manifestation, not onto it. Its own tile is
-                -- occupied by an NPC, so a dive there either lands somewhere the
-                -- client picked for us or fails outright. Stepping out along the
-                -- Raksha->add line keeps us in attack range of it (Necromancy
-                -- reaches ~10 tiles) while putting us further from the sweep,
-                -- and we fall back to its own tile if those are fouled.
-                for _, step in ipairs({2, 1, 0}) do
-                    local tx = math.floor(mx + vx * step + 0.5)
-                    local ty = math.floor(my + vy * step + 0.5)
+            -- Must actually be out of the sweep.
+            local ox, oy = tx - cx, ty - cy
+            if math.sqrt(ox * ox + oy * oy) >= clearance then
+                local inArena = true
+                if arenaCenter then
+                    local ax = tx - arenaCenter.x
+                    local ay = ty - arenaCenter.y
+                    inArena = math.sqrt(ax * ax + ay * ay) <= arenaRadius
+                end
 
-                    -- Only worth it if the destination is actually outside the
-                    -- sweep. If the add spawned on top of Raksha, diving to it
-                    -- changes nothing and the ordinary walk-clear is correct.
-                    local dx, dy = tx - cx, ty - cy
-                    local out = math.sqrt(dx * dx + dy * dy) >= clearance
+                if inArena and tileIsClear(tx, ty, hazards) then
+                    local cost = pathHazardCost(player.x, player.y, tx, ty,
+                                                hazards)
+                    local ex, ey = tx - bx, ty - by
+                    local bias = math.sqrt(ex * ex + ey * ey)
 
-                    if out and tileIsClear(tx, ty, hazards) then
-                        ---@diagnostic disable-next-line: undefined-global
-                        local dest = WPOINT.new(tx, ty,
-                                                math.floor(player.z or 0))
-                        if self:diveToTile(dest) then
-                            self:log(string.format(
-                                         "tail sweep while on the manifestation — dived to (%d, %d), %d past it",
-                                         tx, ty, step))
-                            return true
-                        end
+                    if cost < bestCost or
+                        (cost == bestCost and bias < bestBias) then
+                        best, bestCost, bestBias = {x = tx, y = ty}, cost, bias
                     end
                 end
             end
         end
     end
 
+    return best
+end
+
+--- Gets us out of Raksha's 7x7 tail sweep when we are NOT targeting him.
+---
+--- This is the whole answer to "we keep eating the sweep while killing the add",
+--- and it replaces a dive-to-the-manifestation attempt that had six separate
+--- ways to silently give up and fall back to walking. Now there is one job —
+--- reach a safe tile outside the 7x7 — and three ways to do it, tried in order
+--- of how fast they are:
+---
+---   1. Dive to the tile. Instant, and it lands where we aimed.
+---   2. Surge to the tile, via DoAction_Surge_Tile. Also instant, separate
+---      cooldown from Dive, and being TILE-TARGETED is what makes it usable
+---      here — a bare Surge follows our facing, which while we're turned toward
+---      an add is as likely to carry us across the sweep as out of it.
+---   3. Walk, urgently. Slow, but it goes the right way.
+---
+--- Escape is deliberately absent: it moves away from our TARGET, and our target
+--- is the add rather than Raksha, so it can just as easily throw us deeper in.
+---
+--- Every bail-out logs its reason. The previous version failed silently, which
+--- is why "it still isn't dodging" was impossible to tell apart from "it tried
+--- and the dive was on cooldown".
+--- @param clearance number Tiles from Raksha we need to be
+--- @return boolean consumed True if we spent the tick's action
+function Mechanics:escapeSweep(clearance)
+    local center = self.state.arenaCenterBoss
+    local player = Player:getCoords()
+    if not center or not player then return false end
+
+    -- Already clear of it.
+    local dx, dy = player.x - center.x, player.y - center.y
+    if math.sqrt(dx * dx + dy * dy) >= clearance then return false end
+
+    -- The sweep radius goes in as a hazard on top of the real ground hazards,
+    -- so neither the tile search nor the walk can hand back somewhere still
+    -- inside it — or route us out through a floor shadow.
+    local hazards = self:getAllHazardTiles()
+    hazards[#hazards + 1] = hazardBox(center.x, center.y, 0, clearance)
+
+    local target = self:pickSweepEscapeTile(clearance, hazards)
+    if not target then
+        self:log("tail sweep: no safe tile outside the 7x7 — walking clear")
+        self:walkClearOfBoss(clearance)
+        return false -- walking costs no global cooldown
+    end
+
+    local z = math.floor(player.z or 0)
+
+    -- 1. Dive.
+    if self:canDive() then
+        ---@diagnostic disable-next-line: undefined-global
+        if self:diveToTile(WPOINT.new(target.x, target.y, z)) then
+            self:log(string.format("tail sweep: DIVED clear to (%d, %d)",
+                                   target.x, target.y))
+            return true
+        end
+        self:log(string.format("tail sweep: dive to (%d, %d) was rejected",
+                               target.x, target.y))
+    end
+
+    -- 2. Tile-targeted Surge.
+    if Utils:canUseAbility("Surge") then
+        ---@diagnostic disable-next-line: undefined-global
+        local dest = WPOINT.new(target.x, target.y, z)
+        if API.DoAction_Surge_Tile(dest, SWEEP_SURGE_ERROR) then
+            self:log(string.format("tail sweep: SURGED clear to (%d, %d)",
+                                   target.x, target.y))
+            return true
+        end
+        self:log("tail sweep: surge to tile was rejected")
+    end
+
+    -- 3. Walk. Urgent, so a compromised route still beats standing in the 7x7.
+    self:log(string.format(
+                 "tail sweep: no Dive or Surge available — walking to (%d, %d)",
+                 target.x, target.y))
+    self:walkAvoiding(target.x, target.y, hazards, true)
     return false
 end
 
@@ -1472,18 +1555,14 @@ function Mechanics:runStep(step, index, total)
     -- sweep centred on Raksha. Walking costs no global cooldown, so this doesn't
     -- interrupt the add we're killing.
     if not onBoss and step.walkFromBossWhenNotTargeting then
-        -- Dive to the manifestation first if we can. runActive already tried
-        -- this the moment the sweep started; this is the retry for the case
-        -- where Dive was a tick or two off cooldown then and is ready now.
-        if self.state.manifestationActive and
-            self:diveToManifestation(step.walkFromBossWhenNotTargeting) then
-            return false -- movement, so the add keeps taking damage
-        end
-
-        local moved = self:walkClearOfBoss(step.walkFromBossWhenNotTargeting)
-        self:log(string.format(
-                     "step %d/%d: not on boss — walking clear of the sweep%s",
-                     index, total, moved and "" or " (already clear/no tile)"))
+        -- runActive is what normally handles this, every tick, from the moment
+        -- the animation starts. By the time the sequence reaches this step we
+        -- are usually already clear and escapeSweep returns straight away; it
+        -- stays here so the escape is still attempted if the definition has no
+        -- escapeSweepWhenNotTargeting set.
+        self:escapeSweep(step.walkFromBossWhenNotTargeting)
+        self:log(string.format("step %d/%d: not on boss — escaping the sweep",
+                               index, total))
         return false
     end
 
@@ -1524,7 +1603,6 @@ function Mechanics:begin(anim, definition)
     self.state.stepTick = 0
     self.state.stepTimeMs = 0
     self.state.stepArrivedTick = nil
-    self.state.addDiveDone = false
     self.state.lastMoveTick = -1
     self.state.poolsActive = false
     self.state.lastFired[anim] = tick
@@ -1578,25 +1656,23 @@ function Mechanics:runActive(boss)
     local tick = API.Get_tick()
     local elapsed = tick - self.state.startTick
 
-    -- A tail sweep has started and we're on the Shadow manifestation: dive to
-    -- it, NOW, before any of the sequence below runs.
+    -- A tail sweep has started and we are NOT on Raksha: get out of the 7x7
+    -- NOW, before any of the sequence below runs.
     --
     -- This deliberately jumps the queue. The sweep sequences open with a hold —
     -- 33707 sits on Anticipation for a full 2000ms, 33706 has a 2 tick pre-delay
     -- — and only then reach the step that moves us. That pacing is right when
-    -- we're on the boss and Escape will teleport us out in one action, but while
-    -- we're on the add it just means standing in the 7x7 for the whole wind-up
-    -- and then starting to WALK. The dive is instant, so it costs nothing to
-    -- take it immediately and let the rest of the sequence play out afterwards.
+    -- we're on the boss, where Escape teleports us out in one action, but while
+    -- we're on an add it meant standing in the sweep for the whole wind-up and
+    -- only then starting to WALK. That is why we were still being hit.
     --
-    -- One attempt per mechanic: if Dive is on cooldown we fall through to
-    -- walkClearOfBoss in runStep, which is the old behaviour and still correct.
-    if definition.diveToAddWhenNotTargeting and not self.state.addDiveDone then
-        self.state.addDiveDone = true
-        if self.state.manifestationActive and not self:isTargetingBoss() then
-            if self:diveToManifestation(definition.diveToAddWhenNotTargeting) then
-                return true
-            end
+    -- Retried EVERY tick the sweep is live, not once: escapeSweep returns
+    -- immediately once we're outside the radius, so the cost of re-checking is
+    -- nothing, and a Dive or Surge that was a tick off cooldown when the
+    -- animation started now still gets used.
+    if definition.escapeSweepWhenNotTargeting and not self:isTargetingBoss() then
+        if self:escapeSweep(definition.escapeSweepWhenNotTargeting) then
+            return true
         end
     end
 
