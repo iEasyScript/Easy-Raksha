@@ -1394,6 +1394,14 @@ end
 --- True shortly after Raksha announces he's pulling the pools in. That message
 --- is the exact cue to drop everything and clear them, regardless of how many
 --- are up.
+---
+--- Reads the chat through API.GatherEvents_chat_check, which returns an array of
+--- recent events with a `text` field. It used to call API.ChatFind, and that has
+--- been REMOVED from api.lua as of 1.077 — the call was wrapped in pcall, so
+--- instead of erroring it just failed every single time and this function
+--- silently returned false for the whole fight. The siphon cue was therefore
+--- dead: pools only ever got cleared by the count threshold or by phase 3's
+--- rotation step, never by Raksha announcing the siphon.
 --- @return boolean
 function Mechanics:siphonImminent()
     local tick = API.Get_tick()
@@ -1401,9 +1409,20 @@ function Mechanics:siphonImminent()
     -- Only re-scan the chat once a tick; this runs 12-20 times per tick.
     if tick ~= self.state.lastSiphonCheckTick then
         self.state.lastSiphonCheckTick = tick
-        local ok, found = pcall(API.ChatFind, Constants.SIPHON_CHAT, 1)
-        if ok and found and found.text and found.text ~= "" then
-            self.state.lastSiphonTick = tick
+
+        local ok, events = pcall(API.GatherEvents_chat_check)
+        if ok and type(events) == "table" then
+            for _, event in ipairs(events) do
+                -- Entries are {text = "..."} in every other caller in this
+                -- codebase, but tolerate a bare string too.
+                local text = (type(event) == "table" and event.text) or event
+                if type(text) == "string" and
+                    text:find(Constants.SIPHON_CHAT, 1, true) then
+                    self:log("siphon announced: " .. text)
+                    self.state.lastSiphonTick = tick
+                    break
+                end
+            end
         end
     end
 

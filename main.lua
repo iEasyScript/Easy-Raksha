@@ -208,7 +208,11 @@ local BUFFS = {
 ------------------------------------------
 
 Interact:SetSleep(0, 0, 0)
-API.Write_fake_mouse_do(false)
+-- API.Write_fake_mouse_do(false) was here. It is GONE from api.lua as of 1.077
+-- — the API table has no metatable, so the call resolved to nil and terminated
+-- the script on the very first line it ran. There is no replacement in the new
+-- API (the only mouse functions left are GetTilesUnderCurrentMouse[F]), and
+-- nothing here depended on the setting, so it is simply dropped.
 API.ClearLog()
 
 ------------------------------------------
@@ -1541,20 +1545,88 @@ end
 -- kill. Instance-creation handling is copied from Rasial verbatim; the 1188 /
 -- 1591 interface ids are the shared RS3 instance dialogs, not boss-specific.
 
--- Seconds to wait for a new-instance attempt to take effect before retrying,
--- and how long an instance is kept before forcing a fresh one.
+-- Seconds to wait for a new-instance attempt to take effect before retrying.
 local INSTANCE_TIMEOUT = 30
-local INSTANCE_MAX_AGE = 58 * 60
+
+--- The instance settings window, and the component on it that confirms and
+--- creates the instance.
+---
+--- This window has NO varbit, which is the whole reason the old detection broke.
+--- It used `API.VB_FindPSettinOrder(2874).state == 18`, and 2874 is the shared
+--- "blocking interface" varbit that PACKS TWO BYTES (api.lua: "checks both set1
+--- and set2 any match in those 2 bytes"). Comparing the raw state to a single
+--- number only works when nothing else is flagged in the other byte, so it was
+--- always fragile — any change to what else counts as blocking silently breaks
+--- it, and nothing else in the codebase reads 2874 that way.
+---
+--- API.GetInterfaceOpenBySize is the right tool and says so in its own doc:
+--- "used for determining if interfaces with no VB and floating popup windows are
+--- open". FleshHatcher already detects this exact window that way.
+local INSTANCE_INTERFACE = 1591
+local INSTANCE_CONFIRM_COMPONENT = 56
+
+--- Varbit holding when the current instance EXPIRES, as an absolute count of
+--- minutes since the epoch. Zero/absent means we have no instance.
+---
+--- This replaces timing the instance ourselves from os.clock(). Ours was a guess
+--- that started when we thought we'd made an instance and got thrown away on
+--- every script restart; this is the game's own number, so it stays correct
+--- across restarts and tells us how long is actually left rather than how long
+--- we think has passed.
+local INSTANCE_EXPIRY_VARBIT = 9925
+
+--- Minutes that must remain before we'll rejoin rather than make a fresh
+--- instance. A Raksha kill plus the walk in runs a few minutes, so rejoining one
+--- about to expire would strand us mid-fight.
+local INSTANCE_MIN_MINUTES = 6
+
+--- Seconds to leave the instance flow alone after a successful creation.
+---
+--- This is a latch, and dropping it is what broke instance entry: the OLD code
+--- set `instanceStartTime = os.clock()` on success, and that non-zero value was
+--- doing double duty as both the age tracker AND the "we have an instance now"
+--- flag that flipped the next call from create to rejoin. Replacing the age
+--- tracking with varbit 9925 was right; losing the flag was not.
+---
+--- Without it, the moment the confirm click lands we come straight back round,
+--- read the varbit before the game has populated it, see 0 minutes left, and
+--- start creating another instance — clicking a gate we are already walking
+--- through. That spins until the timeout watchdog gives up and teleports to
+--- War's Retreat.
+local INSTANCE_CREATE_GRACE = 12
 
 local RakshaLobby = {
     variables = {
-        instanceStartTime = 0, -- os.clock() when the current instance was made
+        -- Short post-creation latch (see INSTANCE_CREATE_GRACE), NOT an age
+        -- tracker — varbit 9925 owns the age.
+        instanceCreatedAt = 0,
         rejoinAttempts = 0, -- consecutive rejoin tries this trip
         lastInstanceAttempt = 0, -- os.clock() of the pending new-instance attempt
         instanceAttemptCount = 0, -- consecutive new-instance timeouts
         lobbyEnteredTick = nil -- tick we arrived, for the conjure wait window
     }
 }
+
+--- Minutes left on the current instance; 0 when there isn't one.
+--- @return number
+local function instanceMinutesLeft()
+    local expiry = API.VB_FindPSettinOrder(INSTANCE_EXPIRY_VARBIT)
+    if not expiry or type(expiry.state) ~= "number" or expiry.state <= 0 then
+        return 0
+    end
+
+    -- The varbit is an absolute wall-clock minute, so this compares against the
+    -- local clock rather than any elapsed time we tracked. The -1 discards the
+    -- partial minute we're currently inside.
+    local nowMinutes = math.floor(os.time() / 60)
+    return (expiry.state - nowMinutes) - 1
+end
+
+--- True while the instance settings window is on screen.
+--- @return boolean
+local function instanceInterfaceOpen()
+    return API.GetInterfaceOpenBySize(INSTANCE_INTERFACE) and true or false
+end
 
 --- In the lobby: not at War's Retreat, NOT yet in the instance, and the Security
 --- gate is nearby. Requiring "not instanced" keeps the lobby and the fight
@@ -1571,8 +1643,19 @@ function RakshaLobby:atLocation()
     return #Utils:findAll(gate.id, gate.type, 30) > 0
 end
 
---- Creates a fresh instance through the gate, clicking through the
---- create-instance dialog when it appears. Copied from Rasial's startNewInstance.
+--- Creates a fresh instance through the gate.
+---
+--- Three stages, checked newest-first so we always answer the furthest point
+--- we've reached rather than re-clicking an earlier one:
+---   1. The settings window is up -> confirm it, and we're in.
+---   2. A dialogue is up          -> pick the SECOND option. This is part of
+---      the create flow, not an "you already have an instance" prompt — it has
+---      to be answered or the settings window never appears.
+---   3. Neither                   -> click the gate to start the flow.
+---
+--- Whether we should be creating an instance at all is decided upstream in
+--- handleInstance, from the expiry varbit. By the time we're here that call has
+--- already been made, so the dialogue is simply a step to get through.
 --- @return boolean
 function RakshaLobby:startNewInstance()
     local gate = Constants.OBJECTS.SECURITY_GATE
@@ -1582,26 +1665,31 @@ function RakshaLobby:startNewInstance()
         self.variables.lastInstanceAttempt = os.clock()
     end
 
+    if instanceInterfaceOpen() then
+        ---@diagnostic disable-next-line:missing-parameter
+        if API.DoAction_Interface(0x24, 0xffffffff, 1, INSTANCE_INTERFACE,
+                                  INSTANCE_CONFIRM_COMPONENT, -1,
+                                  API.OFF_ACT_GeneralInterface_route) then
+            Utils:log("Instance settings window confirmed — creating instance")
+            self.variables.lastInstanceAttempt = 0
+            self.variables.instanceAttemptCount = 0
+            self.variables.rejoinAttempts = 0
+            self.variables.instanceCreatedAt = os.clock()
+            return true
+        end
+        return false
+    end
+
+    -- Second option on the dialogue (interface 1188, component 13).
     if API.Check_Dialog_Open() then
-        -- Confirm "create new instance" on the dialog
+        Utils:log("Instance dialogue open — choosing the second option", "debug")
         ---@diagnostic disable-next-line:missing-parameter
         return API.DoAction_Interface(0xffffffff, 0xffffffff, 0, 1188, 13, -1,
                                       API.OFF_ACT_GeneralInterface_Choose_option)
-    elseif API.VB_FindPSettinOrder(2874).state == 18 then
-        -- Enter-instance interface is up: click it
-        ---@diagnostic disable-next-line:missing-parameter
-        if API.DoAction_Interface(0x24, 0xffffffff, 1, 1591, 56, -1,
-                                  API.OFF_ACT_GeneralInterface_route) then
-            self.variables.instanceStartTime = os.clock()
-            self.variables.lastInstanceAttempt = 0
-            self.variables.instanceAttemptCount = 0
-            return true
-        end
-    else
-        ---@diagnostic disable-next-line
-        return Interact:Object(gate.name, gate.action)
     end
-    return false
+
+    ---@diagnostic disable-next-line
+    return Interact:Object(gate.name, gate.action)
 end
 
 --- Re-enters the live instance without resetting its timer.
@@ -1635,13 +1723,45 @@ function RakshaLobby:handleInstance()
         end
     end
 
-    -- New instance when we have none, the current one is near expiry, or rejoin
-    -- has failed too many times; otherwise rejoin the live instance.
-    if self.variables.instanceStartTime == 0 or
-        ((os.clock() - self.variables.instanceStartTime) > INSTANCE_MAX_AGE) or
-        self.variables.rejoinAttempts > 3 then
+    -- ALREADY MID-FLOW: finish what we started.
+    --
+    -- Once the settings window or the dialogue is up we are committed to
+    -- creating this instance, and re-running the rejoin-vs-create decision
+    -- underneath it would abandon a half-finished creation every tick.
+    if instanceInterfaceOpen() or API.Check_Dialog_Open() then
         return self:startNewInstance()
     end
+
+    -- JUST CREATED ONE: leave it alone while the game catches up. See
+    -- INSTANCE_CREATE_GRACE — varbit 9925 is not populated the instant the
+    -- confirm click lands, so without this we read 0 minutes left and
+    -- immediately start building another instance on top of the one we just
+    -- made.
+    if self.variables.instanceCreatedAt > 0 then
+        local since = os.clock() - self.variables.instanceCreatedAt
+        if since < INSTANCE_CREATE_GRACE then return false end
+        self.variables.instanceCreatedAt = 0
+    end
+
+    -- Rejoin only when the game says there is genuinely enough time left on the
+    -- instance; otherwise make a fresh one.
+    --
+    -- The expiry comes straight from varbit 9925 now, so this survives a script
+    -- restart and knows the real remaining time. The old check compared
+    -- os.clock() against an instanceStartTime we set ourselves, which reset to 0
+    -- every launch and therefore made a brand new instance on the first trip of
+    -- every session — throwing away whatever was still live.
+    local minutesLeft = instanceMinutesLeft()
+
+    if minutesLeft < INSTANCE_MIN_MINUTES or self.variables.rejoinAttempts > 3 then
+        if minutesLeft > 0 then
+            Utils:log(string.format(
+                          "Instance has only %d min left — creating a fresh one",
+                          minutesLeft))
+        end
+        return self:startNewInstance()
+    end
+
     return self:rejoiningInstance()
 end
 
@@ -1679,8 +1799,9 @@ function RakshaFight:reset()
     -- first iteration and phases 1-3 never ran again.
     mechanics:resetFight()
 
-    -- Fresh rejoin/new-instance counters each trip, but keep instanceStartTime
-    -- so we know how old the live instance is and when to remake it.
+    -- Fresh rejoin/new-instance counters each trip. Nothing tracks the
+    -- instance's age any more — varbit 9925 is the source of truth for that, so
+    -- there is no local state to preserve across trips.
     RakshaLobby.variables.rejoinAttempts = 0
     RakshaLobby.variables.lastInstanceAttempt = 0
     RakshaLobby.variables.instanceAttemptCount = 0
@@ -2243,8 +2364,14 @@ local function reclaimAtDeathsOffice()
             advance(2)
         end
     elseif step == 2 then
-        -- Wait for the reclaim interface to open
-        if API.VB_FindPSettinOrder(2874).state == 18 then advance(3) end
+        -- Wait for Death's reclaim interface to open.
+        --
+        -- Detected by SIZE, not by varbit 2874. Same fix as the instance window
+        -- in the lobby: 2874 packs two bytes, so comparing its raw state to a
+        -- single number is only right when nothing else is flagged, and it
+        -- stopped matching. Asking whether interface 1626 is open is direct and
+        -- can't drift — and 1626 is the interface we go on to click anyway.
+        if API.GetInterfaceOpenBySize(1626) then advance(3) end
     elseif step == 3 then
         -- Choose "reclaim items"
         if API.DoAction_Interface(0xffffffff, 0xffffffff, 1, 1626, 47, -1,
