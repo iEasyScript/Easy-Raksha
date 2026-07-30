@@ -51,6 +51,9 @@ function Mechanics.new(options)
         stepTick = 0, -- tick the current step fired, for its `wait`
         stepTimeMs = 0, -- os.clock ms it fired, for real-time `waitMs`
         stepArrivedTick = nil, -- tick we reached the step, for any pre-delay
+        -- One dive-to-the-add attempt per mechanic, so a Dive on cooldown can't
+        -- turn into a click every iteration. See runActive.
+        addDiveDone = false,
 
         -- Presence-based adds (Shadow Energy)
         addsActive = false,
@@ -79,6 +82,8 @@ function Mechanics.new(options)
         -- Shadow manifestation (NPC 27355) being killed
         manifestationActive = false,
         lastManifestAbilityTick = -99, -- GCD pacing for manifestation DPS
+        manifestTargetId = nil, -- Unique_Id of the one we're attacking
+        lastManifestTargetTick = -99, -- when we last clicked it
 
         -- Expel pacing, in real milliseconds (sub-tick — see EXPEL_INTERVAL_MS)
         lastExpelTick = -99,
@@ -311,6 +316,11 @@ local INTERACT_TICKS = 1 -- one clean interaction per tick
 -- attacking. Long enough that the periodic re-assert almost never cancels a
 -- real attack.
 local POOL_RECLICK_TICKS = 5
+
+-- The same watchdog for the Shadow manifestation. There is only ever one, so
+-- this exists purely so a click that silently failed can't leave us standing
+-- next to something we think we're already attacking.
+local MANIFEST_RECLICK_TICKS = 5
 
 -- Ticks to wait between clicking a pool and surging at it, so the character has
 -- actually finished turning to face it first. Surge follows facing, not the
@@ -583,6 +593,19 @@ local ORBIT_SLOTS = 16
 -- we travel.
 local ORBIT_STEP_SLOTS = 2
 
+-- Phase 4 walk-back tuning. See Mechanics:returnToPhase4Home.
+--
+-- Beyond HOME_HURRY_DISTANCE we are out of position badly enough to re-issue the
+-- walk every tick instead of pacing it — which is what an Escape leaves us. At
+-- or inside it we're close enough that the normal pacing avoids twitching
+-- between adjacent tiles.
+local HOME_HURRY_DISTANCE = 3
+
+-- Past this, walking back is slow enough to be worth a Dive. Set below Dive's
+-- ~10 tile reach so a dive that lands short still covers most of the gap, and
+-- above HOME_HURRY_DISTANCE so short corrections never burn the cooldown.
+local HOME_DIVE_DISTANCE = 6
+
 --- Ring offsets in a fixed rotational order, cached per radius.
 ---
 --- Built with cos/sin once at first use. Slots are matched to tiles by DISTANCE
@@ -749,6 +772,7 @@ function Mechanics:resetFight()
     self.state.poolClearRequested = false
     self.state.lastPoolSurgeTick = -99
     self.state.manifestationActive = false
+    self.state.manifestTargetId = nil
     self.state.instakillActive = false
     self.state.lethalTarget = nil
 
@@ -1030,6 +1054,78 @@ function Mechanics:walkAvoiding(x, y, hazards, urgent)
     return true
 end
 
+--- Dives to the Shadow manifestation to clear a tail sweep.
+---
+--- This is the fast answer to "a sweep started and we're on the add". The sweep
+--- is a 7x7 centred on Raksha and the manifestation spawns away from him, so
+--- beside the add is both outside the sweep AND where we want to be anyway —
+--- one movement does the escape and keeps us on the kill.
+---
+--- It has to be a Dive. Escape moves away from our TARGET, which while we're on
+--- the manifestation is the manifestation and not Raksha, so it can throw us
+--- deeper into the sweep. Surge follows our facing, same problem. Walking goes
+--- the right way but loses the race with the animation, which is what we were
+--- doing and why we kept eating it. Dive is instant and takes a destination.
+--- @param clearance number Tiles from Raksha the destination must be
+--- @return boolean dived
+function Mechanics:diveToManifestation(clearance)
+    local center = self.state.arenaCenterBoss
+    local player = Player:getCoords()
+    if not center or not player then return false end
+    if not self:canDive() then return false end
+
+    local sm = Constants.ADDS.SHADOW_MANIFESTATION
+    local cx, cy = math.floor(center.x), math.floor(center.y)
+    local hazards = self:getAllHazardTiles()
+
+    for _, m in ipairs(self:findAnyType(sm.id, sm.range)) do
+        local tile = m.Tile_XYZ
+        if (m.Life or 0) > 0 and tile then
+            local mx, my = math.floor(tile.x), math.floor(tile.y)
+
+            -- Unit vector from Raksha toward the add, so "further out" is a
+            -- direction we can step along.
+            local vx, vy = mx - cx, my - cy
+            local length = math.sqrt(vx * vx + vy * vy)
+
+            if length > 0 then
+                vx, vy = vx / length, vy / length
+
+                -- Aim NEXT TO the manifestation, not onto it. Its own tile is
+                -- occupied by an NPC, so a dive there either lands somewhere the
+                -- client picked for us or fails outright. Stepping out along the
+                -- Raksha->add line keeps us in attack range of it (Necromancy
+                -- reaches ~10 tiles) while putting us further from the sweep,
+                -- and we fall back to its own tile if those are fouled.
+                for _, step in ipairs({2, 1, 0}) do
+                    local tx = math.floor(mx + vx * step + 0.5)
+                    local ty = math.floor(my + vy * step + 0.5)
+
+                    -- Only worth it if the destination is actually outside the
+                    -- sweep. If the add spawned on top of Raksha, diving to it
+                    -- changes nothing and the ordinary walk-clear is correct.
+                    local dx, dy = tx - cx, ty - cy
+                    local out = math.sqrt(dx * dx + dy * dy) >= clearance
+
+                    if out and tileIsClear(tx, ty, hazards) then
+                        ---@diagnostic disable-next-line: undefined-global
+                        local dest = WPOINT.new(tx, ty,
+                                                math.floor(player.z or 0))
+                        if self:diveToTile(dest) then
+                            self:log(string.format(
+                                         "tail sweep while on the manifestation — dived to (%d, %d), %d past it",
+                                         tx, ty, step))
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
 --- Walks to the nearest hazard-clear tile at least `distance` tiles from Raksha.
 ---
 --- This exists because Escape moves away from our TARGET and Surge follows our
@@ -1060,6 +1156,80 @@ function Mechanics:walkClearOfBoss(distance)
     return self:walkAvoiding(target.x, target.y, hazards, true)
 end
 
+--- Phase 4 walk-back, and the one movement in the fight that has to be fast.
+---
+--- Escape throws us the better part of ten tiles off the spot we hold beside
+--- Raksha, and every tick spent out there is a tick he can spend on shadow bombs
+--- instead of the tail sweep we can actually dodge. Getting back was slow for
+--- three compounding reasons, none of them the Escape itself: the walk was paced
+--- at returnEveryTicks (3), each re-issue only hopped ORBIT_STEP_SLOTS (2) round
+--- the ring, and it took the arc even when nothing was in the way. Closing an
+--- eight tile gap therefore cost a dozen-odd ticks on a clear floor.
+---
+--- Three routes, best first:
+---   1. Dive straight onto the tile when it's off cooldown and the tile is
+---      clear. Instant, and the same trick the pool chase already uses.
+---   2. Walk the straight line when nothing lethal sits on it. The arc exists to
+---      route around floor shadows; with none in the way, going round is pure
+---      delay.
+---   3. Fall back to the orbit arc, which is still the only thing that reliably
+---      gets us round a shadow rather than through it.
+---
+--- Pacing is by distance: re-issue every tick while we're genuinely out of
+--- position, and only fall back to returnEveryTicks for the final settle, so we
+--- aren't spamming one-tile nudges once we're basically home.
+--- @param player table
+--- @param tick number
+--- @param hazards table[]
+function Mechanics:returnToPhase4Home(player, tick, hazards)
+    local home = self:getHome()
+    if not home then return end
+
+    local dx, dy = home.x - player.x, home.y - player.y
+    local distance = math.sqrt(dx * dx + dy * dy)
+    if distance <= 1 then return end -- on it, near enough
+
+    local pace = (distance > HOME_HURRY_DISTANCE) and 1 or
+                     (Constants.HOME.returnEveryTicks or 3)
+    if (tick - self.state.lastHomeMoveTick) < pace then return end
+
+    local homeClear = tileIsClear(home.x, home.y, hazards)
+
+    -- 1. Dive the long gap.
+    if homeClear and distance > HOME_DIVE_DISTANCE and self:canDive() then
+        self.state.lastHomeMoveTick = tick
+        ---@diagnostic disable-next-line: undefined-global
+        local dest = WPOINT.new(home.x, home.y, math.floor(player.z or 0))
+        if self:diveToTile(dest) then
+            self:log(string.format("phase 4: dived home, %.1f tiles out",
+                                   distance))
+            return
+        end
+    end
+
+    -- 2. Straight line, when it's clean.
+    if homeClear and
+        pathHazardCost(player.x, player.y, home.x, home.y, hazards) == 0 then
+        self.state.lastHomeMoveTick = tick
+        ---@diagnostic disable-next-line: undefined-global
+        API.DoAction_WalkerW(WPOINT.new(home.x, home.y, home.z))
+        return
+    end
+
+    -- 3. Round the ring, avoiding whatever is in the way.
+    local homeSlot = self:orbitNearestSlot(
+                         math.floor(self.state.arenaCenterBoss.x) +
+                             (Constants.PHASE4.homeOffsetX or 4),
+                         math.floor(self.state.arenaCenterBoss.y))
+
+    local hop = self:planOrbitMove(hazards, homeSlot)
+    if hop then
+        self.state.lastHomeMoveTick = tick
+        ---@diagnostic disable-next-line: undefined-global
+        API.DoAction_WalkerW(WPOINT.new(hop.x, hop.y, hop.z))
+    end
+end
+
 --- Walks back toward home once we've drifted off it and nothing is threatening.
 --- Movement costs no global cooldown, so the rotation keeps attacking through
 --- it. This is what makes positioning repeatable between mechanics.
@@ -1068,29 +1238,16 @@ function Mechanics:returnHome()
     if not player then return end
 
     local tick = API.Get_tick()
-    if (tick - self.state.lastHomeMoveTick) <
-        (Constants.HOME.returnEveryTicks or 3) then
-        return
-    end
-
     local hazards = self:getAllHazardTiles()
 
-    -- Phase 4: travel the ring rather than walking a straight line to the home
-    -- tile. planOrbitMove picks the arc that doesn't cross a shadow, so going
-    -- home can no longer take us back through the thing we just dodged — which
-    -- is precisely what it used to do.
+    -- Phase 4 does its own pacing, because "how fast do we need to be back?"
+    -- has a very different answer there — see returnToPhase4Home.
     if self.state.phase >= 4 and self.state.arenaCenterBoss then
-        local homeSlot = self:orbitNearestSlot(
-                             math.floor(self.state.arenaCenterBoss.x) +
-                                 (Constants.PHASE4.homeOffsetX or 4),
-                             math.floor(self.state.arenaCenterBoss.y))
+        return self:returnToPhase4Home(player, tick, hazards)
+    end
 
-        local hop = self:planOrbitMove(hazards, homeSlot)
-        if hop then
-            self.state.lastHomeMoveTick = tick
-            ---@diagnostic disable-next-line: undefined-global
-            API.DoAction_WalkerW(WPOINT.new(hop.x, hop.y, hop.z))
-        end
+    if (tick - self.state.lastHomeMoveTick) <
+        (Constants.HOME.returnEveryTicks or 3) then
         return
     end
 
@@ -1315,6 +1472,14 @@ function Mechanics:runStep(step, index, total)
     -- sweep centred on Raksha. Walking costs no global cooldown, so this doesn't
     -- interrupt the add we're killing.
     if not onBoss and step.walkFromBossWhenNotTargeting then
+        -- Dive to the manifestation first if we can. runActive already tried
+        -- this the moment the sweep started; this is the retry for the case
+        -- where Dive was a tick or two off cooldown then and is ready now.
+        if self.state.manifestationActive and
+            self:diveToManifestation(step.walkFromBossWhenNotTargeting) then
+            return false -- movement, so the add keeps taking damage
+        end
+
         local moved = self:walkClearOfBoss(step.walkFromBossWhenNotTargeting)
         self:log(string.format(
                      "step %d/%d: not on boss — walking clear of the sweep%s",
@@ -1359,6 +1524,7 @@ function Mechanics:begin(anim, definition)
     self.state.stepTick = 0
     self.state.stepTimeMs = 0
     self.state.stepArrivedTick = nil
+    self.state.addDiveDone = false
     self.state.lastMoveTick = -1
     self.state.poolsActive = false
     self.state.lastFired[anim] = tick
@@ -1411,6 +1577,28 @@ function Mechanics:runActive(boss)
 
     local tick = API.Get_tick()
     local elapsed = tick - self.state.startTick
+
+    -- A tail sweep has started and we're on the Shadow manifestation: dive to
+    -- it, NOW, before any of the sequence below runs.
+    --
+    -- This deliberately jumps the queue. The sweep sequences open with a hold —
+    -- 33707 sits on Anticipation for a full 2000ms, 33706 has a 2 tick pre-delay
+    -- — and only then reach the step that moves us. That pacing is right when
+    -- we're on the boss and Escape will teleport us out in one action, but while
+    -- we're on the add it just means standing in the 7x7 for the whole wind-up
+    -- and then starting to WALK. The dive is instant, so it costs nothing to
+    -- take it immediately and let the rest of the sequence play out afterwards.
+    --
+    -- One attempt per mechanic: if Dive is on cooldown we fall through to
+    -- walkClearOfBoss in runStep, which is the old behaviour and still correct.
+    if definition.diveToAddWhenNotTargeting and not self.state.addDiveDone then
+        self.state.addDiveDone = true
+        if self.state.manifestationActive and not self:isTargetingBoss() then
+            if self:diveToManifestation(definition.diveToAddWhenNotTargeting) then
+                return true
+            end
+        end
+    end
 
     ----------------------------------------
     -- Instant: one ability, then done
@@ -1893,13 +2081,24 @@ end
 --- @return boolean consumed
 function Mechanics:handleShadowManifestation()
     local sm = Constants.ADDS.SHADOW_MANIFESTATION
-    local present = self:findAnyType(sm.id, sm.range)
+
+    -- LIVE manifestations only — the same filter the pools needed, and the same
+    -- reason we were slow coming off it. A manifestation that has just died
+    -- keeps appearing in the scan for a tick or two with Life at 0, so
+    -- `#present > 0` stayed true, the latch stayed on, the rotation stayed held
+    -- and we carried on clicking a corpse. Dropping the dead ones hands the
+    -- target back to Raksha on the very next iteration.
+    local present = {}
+    for _, m in ipairs(self:findAnyType(sm.id, sm.range)) do
+        if (m.Life or 0) > 0 then present[#present + 1] = m end
+    end
 
     if #present == 0 then
         -- Gone: hand the target back to Raksha once.
         if self.state.manifestationActive then
             self.state.manifestationActive = false
-            self:log("Shadow manifestation gone — back to Raksha")
+            self.state.manifestTargetId = nil
+            self:log("Shadow manifestation dead — back to Raksha")
             self:reattackBoss()
         end
         return false
@@ -1910,17 +2109,36 @@ function Mechanics:handleShadowManifestation()
         self:log("Shadow manifestation up — killing fast")
     end
 
-    -- Target it so our abilities land on it — once per tick, or repeated clicks
-    -- cancel each other.
     local tick = API.Get_tick()
-    if (tick - self.state.lastManifestAbilityTick) < GCD_TICKS then
-        return true -- own the tick while the GCD runs down
+    local target = present[1]
+
+    -- Acquire it ONCE, ahead of the global-cooldown gate.
+    --
+    -- Two fixes in one. The click used to sit behind the GCD gate, so a
+    -- manifestation that spawned mid-cast wasn't even targeted until the
+    -- previous ability finished — three ticks of standing still before the kill
+    -- started. And it fired on every pass through, which re-clicks an attack we
+    -- are already running; repeated attack clicks cancel each other, so we were
+    -- restarting the attack every three ticks and landing very little of it.
+    -- Now it's click once and hold, with MANIFEST_RECLICK_TICKS as a watchdog so
+    -- a click that silently failed can't strand us. Same shape as the pools.
+    local stale = (tick - self.state.lastManifestTargetTick) >=
+                      MANIFEST_RECLICK_TICKS
+    if self.state.manifestTargetId ~= target.Unique_Id or stale then
+        API.DoAction_NPC__Direct(0x2a, API.OFF_ACT_AttackNPC_route, target)
+        self.state.manifestTargetId = target.Unique_Id
+        self.state.lastManifestTargetTick = tick
     end
-    self:attackNpc(sm.id)
 
     -- Revolution owns damage — it's targeted, so the bar will kill it. We skip
     -- the manual Soul Strike stun rather than fighting the bar for the GCD.
     if self.revolution then return true end
+
+    -- Abilities are paced to the global cooldown; firing every loop iteration
+    -- just cancels the previous cast.
+    if (tick - self.state.lastManifestAbilityTick) < GCD_TICKS then
+        return true -- own the tick while the GCD runs down
+    end
 
     -- Soul Strike stuns but needs a residual soul (buff 30123). If we have one,
     -- stun; otherwise Soul Sap it first to generate a soul. Either uses the GCD,

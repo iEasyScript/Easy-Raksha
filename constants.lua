@@ -460,7 +460,19 @@ Constants.MECHANICS = {
         },
         priority = 50,
         exclusive = true,
-        useTicks = true
+        useTicks = true,
+
+        -- On the Shadow manifestation when this starts: DIVE onto it instead,
+        -- immediately, before the sequence above runs at all. The value is the
+        -- clearance from Raksha the add has to have for the dive to be worth
+        -- taking, and it matches walkFromBossWhenNotTargeting so both routes
+        -- agree on what counts as "out of the sweep".
+        --
+        -- Handled in Mechanics:runActive rather than as a step because the whole
+        -- point is skipping the 2 tick pre-delay: walking out of a 7x7 after a
+        -- hold loses the race with the animation, which is how we kept eating
+        -- sweeps while killing the add.
+        diveToAddWhenNotTargeting = 5
         -- retriggerAfter = 0
     },
 
@@ -481,7 +493,13 @@ Constants.MECHANICS = {
         },
         priority = 50,
         exclusive = true,
-        retriggerAfter = 5
+        retriggerAfter = 5,
+
+        -- See the note on the other sweep. It matters more here: this variant
+        -- holds on Anticipation for a full 2000ms before it moves us at all, so
+        -- while we're on the manifestation that was two seconds of standing in
+        -- the 7x7. The dive jumps straight past it.
+        diveToAddWhenNotTargeting = 5
     },
 
     [Constants.ANIM.INSTAKILL_BIND] = {
@@ -571,7 +589,8 @@ Constants.MECHANICS_BY_PHASE = {
             },
             priority = 60,
             exclusive = true,
-            retriggerAfter = 5
+            retriggerAfter = 5,
+            diveToAddWhenNotTargeting = 5
         },
 
         -- The detonation dome. If the bar above Raksha fills it is an instant
