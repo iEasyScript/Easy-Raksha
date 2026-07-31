@@ -1077,6 +1077,13 @@ local PHASE2_ROTATION = {
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
+            {
+        label = "Vulnerability bomb",
+        type = "Inventory",
+        wait = 1,
+        useTicks = true,
+        setupBoundary = true
+    },
     fingerOfDeath(4),
     fingerOfDeath(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
@@ -1110,6 +1117,13 @@ local PHASE3_ROTATION = {
     fingerOfDeath(3),
     fingerOfDeath(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+            {
+        label = "Vulnerability bomb",
+        type = "Inventory",
+        wait = 1,
+        useTicks = true,
+        setupBoundary = true
+    },
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Bloat", wait = 3, useTicks = true},
     volleyOfSouls(3),
@@ -1168,6 +1182,13 @@ local PHASE4_ROTATION = {
     {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
     {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
     adrenalineRenewal(4),
+            {
+        label = "Vulnerability bomb",
+        type = "Inventory",
+        wait = 1,
+        useTicks = true,
+        setupBoundary = true
+    },
     {label = "Death Skulls", wait = 4, useTicks = true},
     
     -- "Ingenuity + Roar of awakening / Ode to deceit spec (0 tick)": Ingenuity
@@ -1618,8 +1639,13 @@ local function instanceMinutesLeft()
     -- The varbit is an absolute wall-clock minute, so this compares against the
     -- local clock rather than any elapsed time we tracked. The -1 discards the
     -- partial minute we're currently inside.
+    --
+    -- Floored so the result is always an integer: the caller logs it with %d,
+    -- and %d on a float without an exact integer representation raises "bad
+    -- argument to 'format'" in Lua 5.3+. Cheap insurance against the varbit ever
+    -- reading back as a float.
     local nowMinutes = math.floor(os.time() / 60)
-    return (expiry.state - nowMinutes) - 1
+    return math.floor(expiry.state - nowMinutes) - 1
 end
 
 --- True while the instance settings window is on screen.
@@ -2168,8 +2194,13 @@ RakshaFight.tasks = {
             -- `getAdrenaline() < getMaxAdrenaline()` — arrive full and the
             -- crystal is skipped, correctly. Printing the arrival value is the
             -- difference between knowing that and guessing at it.
+            -- %.0f, not %d. Player:getAdrenaline() is `varbit / 10`, and `/` is
+            -- always float division in Lua 5.3+ — so 973 adrenaline comes back
+            -- as 97.3, which has no integer representation and makes %d raise
+            -- "bad argument to 'format'". It only blew up when adrenaline wasn't
+            -- a multiple of 10, which is why it looked intermittent.
             Utils:log(string.format(
-                          "Back at War's Retreat — clearing fight state (adrenaline %d/%d)",
+                          "Back at War's Retreat — clearing fight state (adrenaline %.0f/%.0f)",
                           Player:getAdrenaline() or -1,
                           Player:getMaxAdrenaline() or -1))
             RakshaFight:reset()
