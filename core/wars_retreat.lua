@@ -73,6 +73,7 @@ local Utils = require("core.helper")
 --- @field init                 fun(self, config?):WarsRetreat  Creates a new instance of War's Retreat
 --- @field atLocation           fun(self):boolean               Whether or not the player is at War's Retreat
 --- @field loadLastPreset       fun(self):boolean               Load's the last preset loaded by the player
+--- @field requirePresetLoad    fun(self, required?: boolean)   Makes the next bank visit load the preset regardless of the inventory
 --- @field standAtBankChest     fun(self):boolean               Stands one tile in front of the Bank chest
 --- @field prayAtAltarOfWar     fun(self):boolean               Prays at the Altar of War
 --- @field channelAdrenaline    fun(self):boolean               Channels adrenaline at an Adrenaline crystal
@@ -433,6 +434,10 @@ function WarsRetreat:_initializeData()
         -- Consecutive interactions that never went out, and which object they
         -- were against — see _recoverFailedInteract.
         interactFails = {what = nil, count = 0},
+        -- Mandatory preset load pending — see requirePresetLoad. Deliberately
+        -- survives reset(); cleared only once the load is confirmed.
+        presetLoadRequired = false,
+        presetLoadSentTick = nil,
         -- Per-tick _getCurrentStep() memo — see _getCurrentStep.
         _stepCache = nil,
         _stepCacheTick = -1
@@ -537,6 +542,34 @@ function WarsRetreat:loadLastPreset()
     return false
 end
 
+--- Makes the next visit to the bank chest load the preset, whatever the
+--- inventory currently looks like.
+---
+--- For the cases where the inventory is not evidence of anything. The one that
+--- drives it is a BROKEN READ: the client sometimes hands back an inventory
+--- array that is null or has something other than 28 slots, and from then on
+--- every inventory check in the script is answering from garbage. Reloading the
+--- preset rebuilds the container, which is what actually clears it.
+---
+--- Idempotent. Re-asserting a requirement that is already outstanding does
+--- nothing, because the caller is a watchdog on a timer and would otherwise keep
+--- restarting the confirmation clock below and stop it ever completing.
+---
+--- Deliberately survives reset(): the requirement outlives whatever went wrong,
+--- and reset() is precisely the call a recovery path makes on its way back.
+--- @param required? boolean Defaults to true; pass false to cancel a pending requirement
+function WarsRetreat:requirePresetLoad(required)
+    if required == nil then required = true end
+    if required and self.variables.presetLoadRequired then return end
+
+    self.variables.presetLoadRequired = required
+    self.variables.presetLoadSentTick = nil
+
+    if required then
+        Utils:log("Preset load required at the next bank visit", "info")
+    end
+end
+
 --- Moves player to bank chest position
 --- @return boolean: True if movement was initiated
 function WarsRetreat:standAtBankChest()
@@ -632,6 +665,11 @@ function WarsRetreat:reset()
     variables._stepCache = nil
     variables._stepCacheTick = -1
     self.warnings = {}
+
+    -- presetLoadRequired and presetLoadSentTick are deliberately NOT cleared.
+    -- A pending mandatory bank has to outlive the reset a recovery path performs
+    -- on its way back here — clearing it would cancel the requirement at exactly
+    -- the moment it is needed. See requirePresetLoad.
 
     self:_rollAdvancedMovement()
 end
@@ -742,6 +780,13 @@ function WarsRetreat:_createTimerTasks()
                 end
 
                 self:_clearInteractFails()
+                -- Starts the confirmation clock for a forced load, on the first
+                -- attempt only — re-stamping on every retry would let it extend
+                -- its own window instead of bounding it.
+                if self.variables.presetLoadRequired and
+                    not self.variables.presetLoadSentTick then
+                    self.variables.presetLoadSentTick = API.Get_tick()
+                end
                 return true
             end,
             load = true
@@ -949,10 +994,39 @@ end
 -- # STEP CONDITION CHECKS
 ------------------------------------------
 
+--- Ticks a forced preset load is given to land before the inventory is believed.
+---
+--- The click only starts a walk to the chest. Reading the inventory straight
+--- after it reads the state we already had, and if that happened to satisfy the
+--- match check we would clear the requirement and walk away mid-interaction.
+local FORCED_LOAD_SETTLE_TICKS = 10
+
 --- Checks if preset needs loading. Returns step string or nil.
 --- @return string|nil
 --- @private
 function WarsRetreat:_checkLoadPresetCondition()
+    -- An outstanding forced load outranks the inventory check outright — that is
+    -- the whole point of it, since the inventory is what we have decided not to
+    -- trust. It clears only once we have actually banked AND the inventory reads
+    -- back clean, so a broken read can never satisfy it.
+    if self.variables.presetLoadRequired then
+        local sentAt = self.variables.presetLoadSentTick
+        local settled = sentAt and
+                            (API.Get_tick() - sentAt) >= FORCED_LOAD_SETTLE_TICKS
+
+        if settled and self:_inventoryMatchCheck() then
+            self.variables.presetLoadRequired = false
+            self.variables.presetLoadSentTick = nil
+            -- Those attempts counted against the three-strike guard in
+            -- loadLastPreset(). The load is done, so they must not carry into
+            -- the next trip and terminate the script there.
+            self.variables.bankAttempts = 0
+            Utils:log("Forced preset load complete", "info")
+        else
+            return "LOAD PRESET"
+        end
+    end
+
     -- Inventory:IsFull(), not API.InvFull_(): the latter was removed from
     -- api.lua as of 1.077 and would resolve to nil here. Short-circuiting on
     -- bankIfInvFull has been hiding it — the call only happens when that setting

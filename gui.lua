@@ -155,6 +155,8 @@ local PRAYER_COLOR = {0.45, 0.78, 0.98}
 local ADRENALINE_COLOR = {0.98, 0.72, 0.28}
 local DANGER_COLOR = {0.95, 0.30, 0.35}
 local IDLE_COLOR = {0.45, 0.43, 0.52}
+local SUCCESS_COLOR = {0.45, 0.85, 0.55} -- gp figures that are actually money
+local RARE_COLOR = {1.00, 0.84, 0.35} -- gold, for anything off the unique table
 
 --- Rounds to a whole number for %d formatting.
 ---
@@ -872,6 +874,86 @@ local function drawInfoTab(data)
 end
 
 --------------------------------------------------------------------------------
+-- RUNTIME TAB: LOOT
+--------------------------------------------------------------------------------
+
+--- Whole gp with thousands separators.
+---
+--- Not GUILib.formatNumber, which rounds to "1.2M". That reads well for a health
+--- bar and badly for money — the whole point of a gp column is being able to see
+--- the difference between two drops that both abbreviate to the same thing.
+--- @param n number|nil
+--- @return string
+local function gp(n)
+    n = math.floor(tonumber(n) or 0)
+    local formatted = tostring(n)
+    -- Insert separators right to left until no more fit.
+    while true do
+        local replaced
+        formatted, replaced = formatted:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+        if replaced == 0 then break end
+    end
+    return formatted
+end
+
+local function drawLootTab(data)
+    local loot = data.loot or {}
+    local rares = loot.rares or {}
+    local history = loot.history or {}
+
+    ----------------------------------------------------------------
+    -- Totals
+    ----------------------------------------------------------------
+    ui:sectionHeader("Session Value", "")
+
+    if ui:beginInfoTable("##rakshalootvalue", 0.45) then
+        ui:tableRow("Total looted", gp(loot.totalValue) .. " gp")
+        ui:tableRow("GP / hr", gp(loot.gpPerHour), SUCCESS_COLOR)
+        ui:tableRow("GP / kill", gp(loot.gpPerKill))
+        ui:tableRow("Best kill", gp(loot.bestKill))
+        ui:tableRow("Piles looted", tostring(#history))
+        ui:endColumns()
+    end
+
+    ----------------------------------------------------------------
+    -- Rares
+    ----------------------------------------------------------------
+    ui:separator()
+    ui:sectionHeader("Rare Drops", "")
+
+    if #rares == 0 then
+        ui:text("None yet.", "hint")
+    elseif ui:beginColumns("##rakshararetable", {0.44, 0.14, 0.22, 0.20}) then
+        ui:tableRow({"Item", "Kill", "Value", "Time"})
+        for _, r in ipairs(rares) do
+            ui:tableRow({r.name, "#" .. tostring(r.kill), gp(r.value), r.time},
+                        {RARE_COLOR, nil, SUCCESS_COLOR, nil})
+        end
+        ui:endColumns()
+    end
+
+    ----------------------------------------------------------------
+    -- Per kill
+    ----------------------------------------------------------------
+    ui:separator()
+    ui:sectionHeader("Loot Per Kill", "")
+
+    if #history == 0 then
+        ui:text("Nothing looted yet.", "hint")
+        return
+    end
+
+    if ui:beginColumns("##rakshaloothistory", {0.30, 0.42, 0.28}) then
+        ui:tableRow({"Kill", "Value", "Time"})
+        for _, k in ipairs(history) do
+            ui:tableRow({"#" .. tostring(k.kill), gp(k.gp), k.time},
+                        {nil, k.gp > 0 and SUCCESS_COLOR or nil, nil})
+        end
+        ui:endColumns()
+    end
+end
+
+--------------------------------------------------------------------------------
 -- RUNTIME TAB: MECHANICS DEBUG
 --------------------------------------------------------------------------------
 
@@ -973,6 +1055,12 @@ local function drawRuntimeContent(data, gui)
         if ui:beginTab("Dashboard###info", infoFlags) then
             ui:spacing(1)
             safeDraw(drawInfoTab, data)
+            ui:endTab()
+        end
+
+        if ui:beginTab("Loot###loot") then
+            ui:spacing(1)
+            safeDraw(drawLootTab, data)
             ui:endTab()
         end
 

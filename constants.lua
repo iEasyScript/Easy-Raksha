@@ -289,7 +289,7 @@ Constants.ADDS = {
         -- Phase 3 endgame. Below this HP we're close enough to the phase 4
         -- transition (200k) that pushing damage straight into Raksha beats
         -- spending the time on pools — he'll phase before they matter.
-        skipBelowHpInPhase3 = 300000,
+        skipBelowHpInPhase3 = 325000,
 
         -- POOLS ARE CLEARED IN PHASE 3 ONLY.
         --
@@ -431,6 +431,20 @@ Constants.PRAYER_FLICKER = {
 --- disables prayers. Tune down if the logs show us clearing it comfortably.
 Constants.TAIL_SWEEP_CLEARANCE = 7
 
+--- Tiles to retreat when a sweep answer's movement ability is on cooldown.
+---
+--- Escape has a long cooldown next to how often Raksha sweeps at melee range, so
+--- "Escape is down" is the common case, not the rare one. It used to mean we did
+--- not move AT ALL: runStep logged the ability as unavailable and the sequence
+--- marched on to the reattack, so we stood in the 7x7 and wore it.
+---
+--- Three tiles, measured from where we STAND rather than from Raksha. Phase 4
+--- holds a tile PHASE4.homeOffsetX (4) east of him, so three more puts us seven
+--- out — clear of the 7x7 with room to spare, comfortably inside the phase 4
+--- arenaRadius of 10, and still within Necromancy's ~10 tile reach so the
+--- rotation keeps hitting him on the way back in.
+Constants.TAIL_SWEEP_FALLBACK_WALK = 3
+
 --- How the fight loop should respond to each mechanic animation.
 ---
 --- kind:
@@ -485,7 +499,12 @@ Constants.MECHANICS = {
         -- every tick, because the whole point is skipping the 2 tick pre-delay
         -- above: waiting it out and then WALKING loses the race with the
         -- animation, which is why we kept eating sweeps while on the add.
-        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
+        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+
+        -- The step above that actually MOVES us. ensureClearOfSweep waits on the
+        -- sequence only while this ability can genuinely fire; the moment it
+        -- can't, walking takes over. See Mechanics:ensureClearOfSweep.
+        sweepMover = "Escape"
         -- retriggerAfter = 0
     },
 
@@ -513,7 +532,10 @@ Constants.MECHANICS = {
         -- while we were on the manifestation that was two seconds of standing in
         -- the 7x7 before we even started walking out. escapeSweep jumps straight
         -- past it.
-        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
+        escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+
+        -- Surge is this variant's mover — see the note on the other sweep.
+        sweepMover = "Surge"
     },
 
     [Constants.ANIM.INSTAKILL_BIND] = {
@@ -595,16 +617,19 @@ Constants.MECHANICS_BY_PHASE = {
             name = "Tail Sweep (P4) — Escape",
             kind = "sequence",
             steps = {
-                -- Anticipation first: it prevents the stun and prayer-disable,
-                -- and it is off the global cooldown so it costs us no damage.
-                {ability = "Anticipation", wait = 1},
-                {ability = "Escape", walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE, wait = 2},
+                {
+                    ability = "Escape",
+                    walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+                    retreatWhenUnavailable = Constants.TAIL_SWEEP_FALLBACK_WALK,
+                    wait = 4
+                },
                 {attackBoss = true}
             },
             priority = 60,
             exclusive = true,
             retriggerAfter = 5,
-            escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE
+            escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+            sweepMover = "Escape"
         },
 
         -- The detonation dome. If the bar above Raksha fills it is an instant
@@ -619,6 +644,37 @@ Constants.MECHANICS_BY_PHASE = {
             exclusive = true,
             duration = 30,
             retriggerAfter = 5
+        },
+
+        -- Shadow bomb, answered WITHOUT a Surge.
+        --
+        -- The general definition Surges out of the anima cloud, and in phase 4
+        -- that is the wrong tool: Surge travels along our FACING, which nothing
+        -- in the script controls, so it lands us on whichever side of Raksha we
+        -- happened to be pointing at. The whole phase is built on holding ONE
+        -- tile east of him — every other side gives up the adjacency that keeps
+        -- him tail sweeping instead of bombing — so a movement that picks its
+        -- own direction cannot be used here.
+        --
+        -- Stepping back instead keeps us on the line we are already on, which in
+        -- phase 4 is due east. It clears the 5x5 cloud centred on us just as
+        -- well, costs no global cooldown, and returnHome walks us back onto the
+        -- tile the moment the sequence ends.
+        --
+        -- Worth saying plainly: this should be rare. Bombs only come out while
+        -- we are off melee distance, so seeing this fire regularly means we are
+        -- not holding the tile in the first place.
+        [Constants.ANIM.SHADOW_BOMBARDMENT] = {
+            name = "Shadow Bomb (P4) — Freedom + step east",
+            kind = "sequence",
+            steps = {
+                {ability = "Freedom", wait = 4, useTicks = true},
+                {retreat = Constants.TAIL_SWEEP_FALLBACK_WALK, wait = 2},
+                {attackBoss = true}
+            },
+            priority = 90,
+            exclusive = true,
+            retriggerAfter = 10
         }
     }
 }

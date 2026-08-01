@@ -60,6 +60,10 @@ function Mechanics.new(options)
         lastLethalMoveTick = -99, -- pacing for the lethal-ground dodge
         lethalTarget = nil, -- committed escape tile, so we don't re-pick each tick
 
+        -- True once we have got clear of the sweep currently animating. One
+        -- escape per sweep — see ensureClearOfSweep.
+        sweepEscaped = false,
+
         -- Floor shadows, cached by tile. Keyed "x:y" -> {x, y, seen}. Entries
         -- linger briefly after they stop being detected so a scan flicker can't
         -- make us dart back and forth, then are dropped once genuinely gone.
@@ -778,12 +782,14 @@ function Mechanics:resetFight()
     self.state.manifestTargetId = nil
     self.state.instakillActive = false
     self.state.lethalTarget = nil
+    self.state.sweepEscaped = false
 
     self.state.shadowCache = {}
     self.state.expelIndex = 0
 
     self.state.arenaCenter = nil
     self.state.arenaCenterBoss = nil
+    self.state.lastHomeSlotLogged = nil
 
     self.state.lastSiphonTick = -999
     self.state.lastSiphonCheckTick = -1
@@ -812,11 +818,54 @@ end
 --- The home tile we should currently be using: the primary unless something
 --- lethal is sitting on it, in which case the alternate.
 --- @return table|nil {x, y, z}
+--- Logs the phase 4 home tile whenever the chosen ring slot changes.
+---
+--- Diagnostic, and specifically for the question this file cannot answer on its
+--- own: whether Raksha's REPORTED tile (Tile_XYZ) is the centre of his blocked
+--- 5x5 or a corner of it. Everything here assumes centre — homeOffsetX of 4 is
+--- documented as "2 tiles off the edge" of a footprint spanning +/-2, which only
+--- holds from the centre — but constants.lua flags the assumption as unverified,
+--- and if it is actually a corner then the east slot lands off his south-east
+--- corner instead, which is what "we are south of the boss" would look like.
+---
+--- Prints the boss tile, the home tile and the delta between them, so the answer
+--- can be read off a real kill instead of inferred. Slot 1 is due east; the ring
+--- runs anticlockwise in 22.5 degree steps, so 5 is north, 9 west, 13 south.
+--- @param tile table The chosen home tile
+--- @param cx number Boss reported x
+--- @param cy number Boss reported y
+--- @param eastSlot number The slot due east, for comparison
+--- @private
+function Mechanics:logHomeSlot(tile, cx, cy, eastSlot)
+    if self.state.lastHomeSlotLogged == tile.slot then return end
+    self.state.lastHomeSlotLogged = tile.slot
+
+    self:log(string.format(
+                 "phase 4 home: slot %d (east is %d) at (%d, %d); boss reports (%d, %d); delta (%+d, %+d)",
+                 tile.slot, eastSlot, tile.x, tile.y, cx, cy, tile.x - cx,
+                 tile.y - cy))
+end
+
 function Mechanics:getHome()
     -- Phase 4 is a different, smaller arena, so the tile we recorded pre-fight is
-    -- meaningless there. We orbit Raksha instead: home is the east slot on the
-    -- ring, and if something lethal lands on it we take the nearest clear slot
-    -- round the ring rather than an arbitrary nudge.
+    -- meaningless there. We orbit Raksha instead, and home is the EAST slot on
+    -- the ring — always, with no search for somewhere better.
+    --
+    -- It used to walk outward from east to the nearest hazard-free slot, up to
+    -- half the ring away, which is how we ended up holding a spot south of him.
+    -- That relocation was solving a problem twice over and losing the phase in
+    -- the process:
+    --
+    --   * handleInstakill already runs at top priority and moves us off lethal
+    --     ground wherever we are standing, so nothing needs home to dodge.
+    --   * returnToPhase4Home already refuses to walk a fouled route: it checks
+    --     tileIsClear on home and falls through to planOrbitMove, which routes
+    --     around hazards on its own.
+    --
+    -- So the only thing redefining home achieved was moving the spot we hold —
+    -- and phase 4 depends entirely on holding ONE tile east of him. Drift off it
+    -- and he swaps the dodgeable tail sweep for shadow bombs, which is precisely
+    -- the trade PHASE4 exists to avoid.
     --
     -- Expressed in ring slots on purpose, so this agrees exactly with the tiles
     -- returnHome and the lethal dodge actually steer for. When it was a separate
@@ -827,25 +876,13 @@ function Mechanics:getHome()
         if center then
             local d = Constants.PHASE4.homeOffsetX or 4
             local cx, cy = math.floor(center.x), math.floor(center.y)
-            local hazards = self:getAllHazardTiles()
             local eastSlot = self:orbitNearestSlot(cx + d, cy)
 
-            for offset = 0, math.floor(ORBIT_SLOTS / 2) do
-                for _, direction in ipairs({1, -1}) do
-                    local tile = self:orbitTileAt(eastSlot + direction * offset)
-                    if tile and tileIsClear(tile.x, tile.y, hazards) then
-                        tile.name = "orbit " .. tile.slot
-                        return tile
-                    end
-                end
-            end
-
-            -- Every slot fouled: hand the east spot back anyway and let the
-            -- dodge handlers move us somewhere survivable instead.
-            local fallback = self:orbitTileAt(eastSlot)
-            if fallback then
-                fallback.name = "orbit " .. fallback.slot
-                return fallback
+            local tile = self:orbitTileAt(eastSlot)
+            if tile then
+                tile.name = "orbit " .. tile.slot
+                self:logHomeSlot(tile, cx, cy, eastSlot)
+                return tile
             end
         end
     end
@@ -1209,6 +1246,146 @@ function Mechanics:escapeSweep(clearance)
     return false
 end
 
+--- The two animations that mean "a 7x7 is about to land on Raksha's tile".
+local SWEEP_ANIMS = {
+    [Constants.ANIM.TAIL_SWEEP_ESCAPE] = true,
+    [Constants.ANIM.TAIL_SWEEP_FREEDOM] = true
+}
+
+--- Whether we are outside Raksha's tail sweep radius.
+--- @return boolean
+function Mechanics:clearOfSweepRadius()
+    local center = self.state.arenaCenterBoss
+    local player = Player:getCoords()
+    if not center or not player then return false end
+
+    local dx, dy = player.x - center.x, player.y - center.y
+    return math.sqrt(dx * dx + dy * dy) >= Constants.TAIL_SWEEP_CLEARANCE
+end
+
+--- Last line of defence for the tail sweep: a sweep is playing, we are still
+--- inside the 7x7, and no sweep response is running. Get out anyway.
+---
+--- This deliberately sits OUTSIDE the mechanic-registration contest, and that is
+--- the whole point of it. Registration is priority-ranked and a live mechanic
+--- refuses anything that does not outrank it:
+---
+---     local outranks = (active == nil) or
+---                          ((definition.priority or 0) >= (active.priority or 0))
+---
+--- In phase 4 the detonation dome is priority 95 against the sweep's 60, and it
+--- is `sustained` for a FIXED 30 ticks — it finishes on `elapsed >= duration`,
+--- not when the dome animation stops. So for eighteen seconds at a stretch every
+--- tail sweep was refused registration outright: begin() was never called, no
+--- sequence existed, and neither the Escape step nor its retreat fallback ever
+--- got the chance to run.
+---
+--- That is why this reads as a phase 4 dodging problem when the detection is
+--- fine. burnDome returns false, so the rotation kept firing throughout — we
+--- were attacking normally and simply never moving.
+---
+--- Phases 1-3 never hit it because they have no dome. Their top-priority
+--- responses are the bombardment and bind sequences, which finish in a few ticks
+--- and hand the slot straight back.
+--- @param boss table
+--- @return boolean consumed True if we spent the tick's action getting clear
+function Mechanics:ensureClearOfSweep(boss)
+    if not boss.found or not SWEEP_ANIMS[boss.anim] then
+        -- Sweep over. Re-arm for the next one.
+        self.state.sweepEscaped = false
+        return false
+    end
+
+    -- ONE escape per sweep, then hold position.
+    --
+    -- The animation plays on for several ticks after the hit has resolved, and
+    -- this function runs every loop iteration — so without the latch we spent
+    -- all of those ticks fighting returnHome. It walked us onto the home tile at
+    -- four tiles out, we read four as "inside the 7x7" and shoved us back to
+    -- seven, returnHome walked us in again, and round it went. That is the
+    -- back-and-forth shuffle.
+    --
+    -- Once we have got clear the sweep cannot touch us, so from here we stop
+    -- moving and let returnHome put us on the tile and LEAVE us there.
+    if self.state.sweepEscaped then return false end
+
+    -- Outside the radius already — nothing to do but remember that we are.
+    if self:clearOfSweepRadius() then
+        self.state.sweepEscaped = true
+        return false
+    end
+
+    -- Defer to a registered sweep response ONLY while its mover can genuinely
+    -- fire. Escape teleports us out in one action and leaves us at melee range,
+    -- so it is worth a tick's wait — but only if it is actually coming.
+    --
+    -- THE GLOBAL COOLDOWN IS WHY THIS MATTERS. Every rotation ability puts one
+    -- on us for around three ticks, and canUseAbility reads `enabled`, which the
+    -- cooldown clears for the whole bar at once — Escape, Surge and Dive alike.
+    -- So the sequence would reach its movement step mid-cooldown, log "not
+    -- available", mark the step done and walk on to the reattack. We stood in
+    -- the 7x7 waiting on an ability that was never going to come, and the more
+    -- the rotation was firing the more reliably it happened.
+    --
+    -- WALKING is not on the global cooldown. That is the whole point: whatever
+    -- the ability bar is doing, we can always walk out, and escapeSweep's last
+    -- tier is a plain hazard-avoiding walk.
+    local active = self.state.activeDef
+    if active and SWEEP_ANIMS[self.state.activeAnim] then
+        local mover = active.sweepMover
+        if mover and self:isTargetingBoss() and Utils:canUseAbility(mover) then
+            return false
+        end
+    end
+
+    -- escapeSweep returns immediately when we are already outside the radius, so
+    -- running this on every tick of every sweep costs nothing.
+    return self:escapeSweep(Constants.TAIL_SWEEP_CLEARANCE)
+end
+
+--- Backs straight away from Raksha by `tiles`, for when a sweep answer's
+--- movement ability is on cooldown.
+---
+--- Deliberately dumber than escapeSweep(): no tile search, no hazard routing,
+--- no ability. Just step back along the line we're already standing on. That is
+--- what makes it usable as a fallback — it cannot fail to find a tile, and it
+--- cannot spend a global cooldown we may need for the rotation.
+---
+--- Direction comes from where we stand relative to him rather than a hardcoded
+--- compass point. In phase 4 that resolves to due EAST, because the phase holds
+--- a tile east of him and we are backing further out the same way. Deriving it
+--- means a retreat from anywhere else still goes away from him rather than
+--- through him, which a fixed east would not.
+--- @param tiles number Tiles to retreat
+--- @return boolean consumed Always false — walking costs no global cooldown
+function Mechanics:retreatFromBoss(tiles)
+    local player = Player:getCoords()
+    if not player then return false end
+
+    local px, py = math.floor(player.x), math.floor(player.y)
+
+    -- Default east, the side phase 4 holds, for the degenerate case where we
+    -- have no boss reading or are somehow standing on his exact tile.
+    local dx, dy = 1, 0
+
+    local center = self.state.arenaCenterBoss
+    if center then
+        local ox, oy = px - center.x, py - center.y
+        local length = math.sqrt(ox * ox + oy * oy)
+        if length > 0.5 then dx, dy = ox / length, oy / length end
+    end
+
+    local tx = math.floor(px + dx * tiles + 0.5)
+    local ty = math.floor(py + dy * tiles + 0.5)
+    tx, ty = self:clampToArena(tx, ty)
+
+    self:log(string.format("tail sweep: backing off %d tiles to (%d, %d)", tiles,
+                           tx, ty))
+    ---@diagnostic disable-next-line: undefined-global
+    API.DoAction_WalkerW(WPOINT.new(tx, ty, math.floor(player.z or 0)))
+    return false
+end
+
 --- Walks to the nearest hazard-clear tile at least `distance` tiles from Raksha.
 ---
 --- This exists because Escape moves away from our TARGET and Surge follows our
@@ -1295,6 +1472,7 @@ function Mechanics:returnToPhase4Home(player, tick, hazards)
         pathHazardCost(player.x, player.y, home.x, home.y, hazards) == 0 then
         self.state.lastHomeMoveTick = tick
         ---@diagnostic disable-next-line: undefined-global
+        --- Could add a delay here possibly
         API.DoAction_WalkerW(WPOINT.new(home.x, home.y, home.z))
         return
     end
@@ -1561,6 +1739,18 @@ function Mechanics:runStep(step, index, total)
         return self:reattackBoss()
     end
 
+    -- A step that MOVES us without spending an ability. This is how phase 4
+    -- answers anything that would otherwise Surge: Surge follows our facing, and
+    -- our facing is not something the script controls, so it throws us to
+    -- whichever side of Raksha we happen to be pointing at. Backing off along
+    -- the line between us and him keeps us on the side we are already holding —
+    -- east, in phase 4 — and costs no global cooldown.
+    if step.retreat then
+        self:log(string.format("step %d/%d: stepping back %d tiles", index,
+                               total, step.retreat))
+        return self:retreatFromBoss(step.retreat)
+    end
+
     if not step.ability then
         self:log(string.format("step %d/%d: nothing to do", index, total))
         return false
@@ -1595,6 +1785,16 @@ function Mechanics:runStep(step, index, total)
     end
 
     if not Utils:canUseAbility(ability) then
+        -- "Skipping step" used to be the whole story here, and on a tail sweep
+        -- that meant standing in the 7x7 until it landed: the step is marked
+        -- executed either way (see runActive), so the sequence just walked on to
+        -- the reattack having never moved us. A step that declares a retreat
+        -- gets to fall back on it instead.
+        if step.retreatWhenUnavailable then
+            self:log(ability .. " not available — retreating on foot instead")
+            return self:retreatFromBoss(step.retreatWhenUnavailable)
+        end
+
         self:log(ability .. " not available, skipping step")
         return false
     end
@@ -1829,6 +2029,20 @@ function Mechanics:runActive(boss)
                 self.state.lastPoolTargetTick = tick
                 self:reattackBoss()
             end
+
+            -- Walk back onto the home tile BETWEEN sweeps, which update() cannot
+            -- do for us here: returnHome is gated on there being no active
+            -- mechanic, and the dome holds that slot for its whole 30 tick
+            -- duration. Without this, one sweep escape during a dome parks us at
+            -- seven tiles for the rest of it — and range is exactly what makes
+            -- him swap the dodgeable tail sweep for shadow bombs.
+            --
+            -- Skipped while a sweep is actually playing, so this can never walk
+            -- us back into the 7x7 we just left. returnHome paces itself and
+            -- routes around hazards, and walking costs no global cooldown, so
+            -- the burn carries on regardless.
+            if not SWEEP_ANIMS[boss.anim] then self:returnHome() end
+
             return false
         end
 
@@ -2713,6 +2927,12 @@ function Mechanics:update()
     --    Walking costs no global cooldown, so a dodge that only walks lets the
     --    rotation keep firing — see the movement lock in handleInstakill.
     if self:handleInstakill() then return true end
+
+    -- 0b. Tail sweep safety net. Below the lethal ground, which is instant
+    --     death, but above everything else — a sweep that nothing registered a
+    --     response for still has to be walked out of. See ensureClearOfSweep for
+    --     why phase 4's dome made that a routine occurrence.
+    if self:ensureClearOfSweep(boss) then return true end
 
     -- 1. Expel Shadow Energy — top of the actioned priorities.
     if self:handleAdds() then return true end

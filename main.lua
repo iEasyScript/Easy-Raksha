@@ -123,6 +123,19 @@ local LOOT = {
         51094, -- Greater Ricochet ability codex
         51096, -- Greater Chain ability codex
         51098 -- Divert ability codex
+    },
+
+    -- Names for the uniques, keyed by id, mirroring rasial's UNIQUES_DATA.
+    --
+    -- Needed because rares are spotted by scanning the FLOOR rather than by
+    -- reading the loot window, and a ground object's own name field is not
+    -- something to rely on — see recordUniqueDrops.
+    UNIQUES_DATA = {
+        [51082] = {name = "Fleeting boots"},
+        [51086] = {name = "Shadow spike"},
+        [51094] = {name = "Greater Ricochet ability codex"},
+        [51096] = {name = "Greater Chain ability codex"},
+        [51098] = {name = "Divert ability codex"}
     }
 }
 
@@ -130,6 +143,7 @@ local LOOT = {
 local function lootConfigured()
     return (#LOOT.COMMONS + #LOOT.UNIQUES) > 0
 end
+
 
 ------------------------------------------
 -- # BUFFS
@@ -299,8 +313,122 @@ local Common = {
     deathReclaimStep = nil, -- Death's Office reclaim state-machine step
     deathReclaimStepTick = nil, -- Tick the current reclaim step started
     reachedDeathOffice = false, -- True once we've actually arrived at Death
-    deathReclaimed = false -- True once items are back, so we stop and leave
+    deathReclaimed = false, -- True once items are back, so we stop and leave
+
+    -- Loot ledger. See the LOOT TRACKING section.
+    lootValue = 0, -- Total gp of every pile looted this session
+    lootPerKill = {}, -- Newest-first {kill, gp, time}, one per looted pile
+    rareLog = {} -- Newest-first list of unique drops, with the kill they fell on
 }
+
+------------------------------------------
+-- # LOOT TRACKING
+------------------------------------------
+
+--- Live Grand Exchange prices, resolved once per item id per session.
+---
+--- Cached deliberately, and not for tidiness. API.GetExchangePrice is a lookup
+--- out of the client, the GUI redraws every frame, and this codebase has already
+--- been bitten once by a per-frame native call — see the "Unexpected inventory
+--- size" wall that a repeated inventory comparison produced. Prices do not move
+--- enough during a session to be worth paying that twice.
+local priceCache = {}
+
+--- @param id number Item id
+--- @return number gp Unit price, 0 when the exchange has no answer
+local function itemPrice(id)
+    local cached = priceCache[id]
+    if cached ~= nil then return cached end
+
+    -- pcall because an untradeable or unrecognised id is a perfectly ordinary
+    -- thing to find in a drop, and it must not take the fight loop down.
+    local ok, price = pcall(API.GetExchangePrice, id)
+    if not ok or type(price) ~= "number" or price < 0 then price = 0 end
+
+    priceCache[id] = price
+    return price
+end
+
+--- Most rare drops we keep in the log before dropping the oldest.
+local RARE_LOG_LIMIT = 50
+
+--- Most per-kill loot rows we keep. Enough to see a trend, not enough to grow
+--- without bound over an overnight session.
+local LOOT_HISTORY_LIMIT = 50
+
+--- Adds the open loot window's own valuation of the pile to the running total.
+---
+--- Utils:getLootWindowAmount scrapes the "Value: N" line off interface 1622,
+--- which is the game's own GE-based figure for everything in the window. This is
+--- the mechanism rasial/main.lua has been using all along, and it replaced a
+--- per-item pricing pass of mine that recorded nothing at all — the loot tab
+--- stayed empty because that pass depended on LootWindow_GetData returning a
+--- shape it evidently does not, and the pcall around it failed silently.
+---
+--- Using the window's own total also removes the need to price commons by hand:
+--- the number already reflects live prices, stack sizes and every item in the
+--- pile, including anything missing from the LOOT table.
+--- @param gained number Value read from the window BEFORE Loot All was pressed
+--- @return number gp Added this call
+local function recordLootValue(gained)
+    gained = gained or 0
+    if gained <= 0 then
+        Utils:log("Loot window reported no value — nothing added to the ledger",
+                  "debug")
+        return 0
+    end
+
+    Common.lootValue = Common.lootValue + gained
+
+    table.insert(Common.lootPerKill, 1, {
+        kill = Common.killCount,
+        gp = gained,
+        time = os.date("%H:%M:%S")
+    })
+    while #Common.lootPerKill > LOOT_HISTORY_LIMIT do
+        table.remove(Common.lootPerKill)
+    end
+
+    Utils:log(string.format("Looted %d gp on kill #%d (session %d gp)", gained,
+                            Common.killCount, Common.lootValue))
+    return gained
+end
+
+--- Logs any unique sitting on the floor, stamped with the kill it fell on.
+---
+--- Scans the GROUND (object type 3) rather than reading the loot window, which
+--- is how rasial:logUniqueDrop does it and the reason that one works. The pile
+--- is still on the floor at this point — pickUpLoot only reaches here with
+--- getGroundLoot() non-empty — so the uniques are there to be found.
+---
+--- Names come from LOOT.UNIQUES_DATA rather than the object, because a ground
+--- object's name field is not dependable across item types and the ids are a
+--- fixed, known list anyway.
+--- @param drops table[]|nil Ground scan taken BEFORE Loot All was pressed
+local function recordUniqueDrops(drops)
+    if not drops or #drops == 0 then return end
+
+    for _, drop in ipairs(drops) do
+        local id = drop.Id
+        local data = LOOT.UNIQUES_DATA[id]
+        local name = (data and data.name) or ("Unique " .. tostring(id))
+        local value = itemPrice(id)
+
+        table.insert(Common.rareLog, 1, {
+            name = name,
+            id = id,
+            value = value,
+            kill = Common.killCount,
+            time = os.date("%H:%M:%S")
+        })
+        while #Common.rareLog > RARE_LOG_LIMIT do
+            table.remove(Common.rareLog)
+        end
+
+        Utils:log(string.format("RARE DROP: %s on kill #%d (%d gp)", name,
+                                Common.killCount, value), "warn")
+    end
+end
 
 ------------------------------------------
 -- # PREBUILD (War's Retreat dummies)
@@ -1075,8 +1203,11 @@ local PHASE2_ROTATION = {
     -- Living Death takes 5 ticks to land before the next ABILITY, but a potion
     -- is an inventory action and off the global cooldown, so it slots into that
     -- window rather than extending it: 1 + 4 keeps Touch of Death where it was.
+    volleyOfSouls(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    volleyOfSouls(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    volleyOfSouls(3),
     {label = "Living Death", wait = 3, useTicks = true},
     adrenalinePotion(4),
     {label = "Touch of Death", wait = 3, useTicks = true},
@@ -1095,9 +1226,11 @@ local PHASE2_ROTATION = {
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    conjureArmy(2),
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    conjureArmy(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Touch of Death", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
@@ -1812,6 +1945,7 @@ function RakshaFight:reset()
     self.variables.engaged = false
     self.variables.bossDead = false
     self.variables.looted = false
+    self.variables.lootRecorded = false
     self.variables.lootDeadline = 0
     self.variables.lootTimeoutLogged = false
     self.variables.bossSeen = false
@@ -1828,6 +1962,7 @@ function RakshaFight:reset()
     self.variables.transitionHolding = false
     self.variables.transitionEndTick = nil
     self.variables.transitionReattacked = false
+    self.variables.sawPhase4Hp = false
     -- specialActionScanWorks is deliberately NOT reset: it records that the
     -- interface scan can see this button on this client, which stays true
     -- between kills. Clearing it would drop us back to the buff fallback at the
@@ -1888,7 +2023,27 @@ function RakshaFight:pickUpLoot()
                                                               LOOT.UNIQUES), 30)
     end
 
+    -- Record BEFORE taking it. Both sources only exist right now: the window's
+    -- value line is gone once the window closes, and the uniques are read off
+    -- the floor, which Loot All is about to clear.
+    --
+    -- Recorded only once the button press actually lands, and only once per
+    -- kill: this function is on a 1 tick cooldown and runs until the pile is
+    -- gone, so recording on sight would count the same drop several times over.
+    -- Uniques are read off the FLOOR, so they have to be scanned before Loot All
+    -- clears it. The window's value line is read AFTER the press instead, which
+    -- is the order rasial/main.lua uses and the reason its figure is reliable —
+    -- the text is populated by then, where on the frame the window first opens
+    -- it can still be empty and would bank a zero.
+    local uniques = (not self.variables.lootRecorded) and
+                        Utils:findAll(LOOT.UNIQUES, 3, 30) or nil
+
     if API.DoAction_LootAll_Button() then
+        if not self.variables.lootRecorded then
+            self.variables.lootRecorded = true
+            recordUniqueDrops(uniques)
+            recordLootValue(Utils:getLootWindowAmount())
+        end
         self.variables.looted = true
         return true
     end
@@ -1948,6 +2103,44 @@ function RakshaFight:handleFight()
     local boss = self:getBoss()
 
     if boss.found then self.variables.bossSeen = true end
+
+    -- PHASE 4 LATCH, and it lives here — above the transition early-return —
+    -- precisely so nothing below can lose it.
+    --
+    -- mechanics.state.phase is derived from HP, and phase 4 is the one phase HP
+    -- cannot describe: entering it heals Raksha back to 400k, which getPhase
+    -- reads as phase 3. The only window where HP says "4" is between him
+    -- dropping under 200k and that heal — and both of the existing latches can
+    -- miss it:
+    --
+    --   * setPhase(4) on transition release only runs if transitionHolding was
+    --     ever set, which needs the 33707 animation to have been read.
+    --   * the HP backstop further down sits BELOW the transition return, so it
+    --     never runs on a holding iteration.
+    --
+    -- Between them that leaves a real hole: if Raksha reads as unfound while the
+    -- arena changes — which is exactly when he would — neither fires, and after
+    -- the heal HP never says 4 again. Phase stays 3 for the whole of phase 4,
+    -- and every `phase >= 4` branch silently does the wrong thing:
+    --
+    --   * getHome() skips its phase 4 ring entirely and hands back the safespot
+    --     recorded next to the DORMANT boss in the FIRST arena — a tile with no
+    --     meaning in the antechamber, which is how we end up holding a spot
+    --     nowhere near east of him.
+    --   * animation 33707 resolves to the general tail sweep instead of the
+    --     phase 4 one, and the general answer is a bare Surge. Surge follows our
+    --     FACING, and our facing on arrival is arbitrary, so it throws us
+    --     somewhere unrelated to where we meant to stand.
+    --
+    -- Latched off the strongest signal available and never cleared mid-fight:
+    -- once either "we saw him under the phase 4 threshold" or "we started
+    -- holding through the transition" is true, phase 4 has begun.
+    if boss.found and boss.health > 0 and boss.health <= Constants.PHASE_HP.P4 then
+        self.variables.sawPhase4Hp = true
+    end
+    if self.variables.sawPhase4Hp or self.variables.transitionHolding then
+        mechanics:setPhase(4)
+    end
 
     -- Phase 4 transition: sit the whole thing out until the animation ends.
     -- Nothing we send lands, so acting is pure noise — and acting through it is
@@ -2372,6 +2565,108 @@ RakshaFight.tasks = {
 for _, task in pairs(RakshaFight.tasks) do timer:addTask(task) end
 
 ------------------------------------------
+-- # INVENTORY READ RECOVERY
+------------------------------------------
+
+--- How often the watchdog samples. Ticks, not loop iterations: the read itself
+--- is a native call, and this codebase has already been bitten by running one of
+--- those per frame.
+local INVENTORY_CHECK_TICKS = 5
+
+--- Consecutive bad samples before we accept the read is genuinely broken.
+---
+--- One is not enough. The array legitimately reads short for a moment while an
+--- interface is opening or a preset is mid-load, and teleporting out of the
+--- lobby over a single frame of that would be worse than the bug.
+local INVENTORY_BROKEN_SAMPLES = 3
+
+--- Consecutive bad inventory samples seen so far.
+local invBrokenStreak = 0
+
+--- Whether the client's inventory array is currently unusable.
+---
+--- Inventory:IsArrayNull() is exactly this question — its own documentation says
+--- "null or unexpected size", i.e. anything that is not the 28 slots an
+--- inventory has. Wrapped in pcall because a call that throws is itself evidence
+--- the container is not readable.
+--- @return boolean
+local function inventoryReadBroken()
+    local ok, isNull = pcall(function() return Inventory:IsArrayNull() end)
+    if not ok then return true end
+    return isNull and true or false
+end
+
+-- Recovers from a broken inventory read by reloading the preset.
+--
+-- WHY THIS EXISTS. The client intermittently hands back an inventory array that
+-- is null or the wrong length. Nothing downstream can tell: Inventory:InvItemcount
+-- answers 0 for everything, so _inventoryMatchCheck reports a mismatch, the
+-- War's Retreat step machine parks on LOAD PRESET, and the bank task retries
+-- against a container that is never going to read correctly. That is the
+-- "Unexpected inventory size" spam, and it ends in an idle logout because none
+-- of it is real input.
+--
+-- Reloading the preset rebuilds the container, which is what actually clears it
+-- — so the fix is to get to the bank and do exactly that.
+--
+-- NEVER DURING A FIGHT. A teleport mid-Raksha throws the kill away, and the
+-- inventory being unreadable is survivable where a lost instance is not. The
+-- fight has its own consumable handling and none of it routes through here.
+timer:addTask({
+    name = "Inventory read recovery",
+    -- Below death recovery (600), above the fight and War's Retreat tasks. A
+    -- death outranks this: it teleports us anyway and ends at the bank.
+    priority = 550,
+    cooldown = INVENTORY_CHECK_TICKS,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        -- Out of the Raksha fight only, as asked. RakshaFight:atLocation() is
+        -- the arena; the lobby and War's Retreat both fall through to true.
+        if RakshaFight:atLocation() then return false end
+
+        -- Death recovery owns movement while it runs, and it finishes at War's
+        -- Retreat with a bank stop of its own. Two teleport sources racing each
+        -- other is how you get stranded in Death's Office.
+        if Common.isDead then return false end
+
+        return true
+    end,
+    action = function()
+        if not inventoryReadBroken() then
+            if invBrokenStreak > 0 then
+                Utils:log("Inventory read recovered", "info")
+                invBrokenStreak = 0
+            end
+            -- TRUE even though nothing happened. Timer:_execute only starts a
+            -- task's cooldown when the action reports success, so returning
+            -- false here would re-run this every loop iteration and reintroduce
+            -- the per-frame native call this is meant to stop.
+            return true
+        end
+
+        invBrokenStreak = invBrokenStreak + 1
+        if invBrokenStreak < INVENTORY_BROKEN_SAMPLES then return true end
+
+        if not warsRetreat:atLocation() then
+            Utils:log(string.format(
+                          "Inventory read broken on %d consecutive checks — teleporting to War's Retreat",
+                          invBrokenStreak), "warn")
+            Utils:useAbility("War's Retreat Teleport")
+            return true
+        end
+
+        -- At War's Retreat. Force the bank stop rather than trusting the
+        -- ordinary inventory-match route to get us there: that route is decided
+        -- by the very read we have just declared unusable. requirePresetLoad is
+        -- idempotent, so calling it on every sample costs nothing.
+        warsRetreat:requirePresetLoad()
+        return true
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+------------------------------------------
 -- # DEATH RECOVERY
 ------------------------------------------
 
@@ -2529,6 +2824,39 @@ timer:addTask({
 -- # TRACKING
 ------------------------------------------
 
+--- Flattens the loot ledger into the shape the GUI renders.
+---
+--- Sorted by value rather than by name or by when it dropped, so the line that
+--- actually pays for the trip sits at the top. Cheap enough to do per frame: the
+--- table is one entry per DISTINCT item id, which for this drop table is a few
+--- dozen at most, and the prices behind it are already cached.
+--- @return table
+local function buildLootSnapshot()
+    local elapsed = os.time() - Common.scriptStartTime
+    local perHour = elapsed > 0 and (Common.lootValue / (elapsed / 3600)) or 0
+    local perKill = Common.killCount > 0 and
+                        (Common.lootValue / Common.killCount) or 0
+
+    -- COPIED, not handed over by reference. The draw callback runs on ImGui's
+    -- thread (see the note in buildGUIData), so a table the fight loop can still
+    -- table.insert into is one the renderer could be walking mid-write.
+    local rares, history, best = {}, {}, 0
+    for i, r in ipairs(Common.rareLog) do rares[i] = r end
+    for i, k in ipairs(Common.lootPerKill) do
+        history[i] = k
+        if k.gp > best then best = k.gp end
+    end
+
+    return {
+        totalValue = Common.lootValue,
+        gpPerHour = perHour,
+        gpPerKill = perKill,
+        bestKill = best,
+        history = history,
+        rares = rares
+    }
+end
+
 --- Builds the live data the GUI renders each frame.
 --- @return table
 local function buildGUIData()
@@ -2580,7 +2908,8 @@ local function buildGUIData()
         },
         review = mechanics:reviewSnapshot(),
 
-        mechanics = mechanics:tracking()
+        mechanics = mechanics:tracking(),
+        loot = buildLootSnapshot()
     }
 end
 

@@ -372,9 +372,13 @@ end
 --- Renders a labeled row in a table (label on left, value on right).
 --- For 2-column tables: pass label and value as strings
 --- For N-column tables: pass a table of values as the first argument
---- @param labelOrValues string|string[] The label text OR table of column values
---- @param value? string The value text (only for 2-column mode)
---- @param valueColor? number[] Optional RGBA color for value (or array of colors for N-column mode)
+--- Note where the colours go in N-column mode: the SECOND argument, not
+--- valueColor. That is what the body reads, and the two modes are declared as
+--- separate signatures below so neither call style warns.
+--- @overload fun(self: GUILib, values: string[], colors?: number[][])
+--- @param labelOrValues string The label text
+--- @param value? string The value text (2-column mode)
+--- @param valueColor? number[] Optional RGBA colour for the value (2-column mode)
 function GUILib:tableRow(labelOrValues, value, valueColor)
     local c = self.theme.colors
     ImGui.TableNextRow()
@@ -411,6 +415,9 @@ function GUILib:tableRow(labelOrValues, value, valueColor)
         ImGui.TextWrapped(labelOrValues)
         ImGui.PopStyleColor(1)
         ImGui.TableNextColumn()
+        -- `value` is optional, and an omitted one should render as an empty cell
+        -- rather than reaching ImGui as nil.
+        value = value or ""
         if valueColor then
             ImGui.PushStyleColor(ImGuiCol.Text, valueColor[1], valueColor[2],
                                  valueColor[3], valueColor[4] or 1.0)
