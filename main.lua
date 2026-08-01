@@ -28,6 +28,27 @@ local GUI             = require("raksha.gui")
 -- # SETTINGS
 ------------------------------------------
 
+--- Every dose of every potion the rotation will accept for its adrenaline beat.
+---
+--- Both potions are carried in one list rather than picked between, because the
+--- only two places that care — the bank check in LOADOUT and the click in
+--- adrenalinePotion() — can each take the whole list and ask "any of these".
+--- Nothing has to know WHICH one you brought.
+---
+--- ORDER IS PREFERENCE. DoAction_Inventory works down the list, so a bag holding
+--- both drinks the renewal and keeps the replenishment. Swap the two blocks to
+--- reverse that.
+---
+--- Note the two are not equivalent, only interchangeable: they restore different
+--- amounts of adrenaline, and PHASE2_ROTATION's beat after the drink is written
+--- around the renewal's refund. See adrenalinePotion().
+local ADRENALINE_POTION_IDS = {
+    -- Adrenaline renewal potion, doses 1-4
+    49079, 49081, 49083, 49085,
+    -- Enhanced replenishment potion, doses 1-6
+    39220, 39222, 39224, 39226, 39228, 39230
+}
+
 local LOADOUT = {
     {id = 48951, amount = 502, name = "Vulnerability bomb"},
     {id = 42267, amount = 10, name = "Blue blubber jellyfish"}, {
@@ -39,11 +60,11 @@ local LOADOUT = {
     --{id = 47713, amount = 11, name = "Lantadyme incense sticks"},
     --{id = 49405, amount = 1, name = "Binding contract (blood reaver)"},
     {
-        ids = {49079, 49081, 49083, 49085, 39220, 39222, 39224, 39226, 39228, 39230},
-        --ids = {39220, 39222, 39224, 39226, 39228, 39230},
+        ids = ADRENALINE_POTION_IDS,
         amount = 1,
-        name = "Adrenaline renewal"
-        --name = "Enhanced replenishment potion"
+        -- Only ever a log/warning string. The bank check matches on ids, and
+        -- either potion satisfies it.
+        name = "Adrenaline renewal or Enhanced replenishment"
     }
 }
 
@@ -695,54 +716,6 @@ end
 ------------------------------------------
 -- # ROTATION
 ------------------------------------------
-
--- A straight transcription of the PVME Necromancy Raksha rotation:
---   https://pvme.io/pvme-guides/rs3-full-boss-guides/raksha/necromancy/
---
--- Every phase has its own line and gets it in full — a phase transition swaps
--- the entire rotation out (see PHASE_ROTATIONS), so what runs in phase 2 is
--- phase 2's line and nothing else. The guide, verbatim, for reading against:
---
---   Inside instance
---     Conjure army -> Life transfer -> Command ghost
---   Phase 1
---     Surge + Invoke death -> Command skeleton -> Split soul + Vuln bomb under
---     Raksha -> tc + Bloat -> Death skulls -> Volley of souls -> Soul sap ->
---     Divert -> Touch of death -> Soul sap -> Command skeleton
---   Phase 2
---     Living death + Adrenaline renewal -> Touch of death -> Death skulls ->
---     Soul sap -> Finger of death -> Finger of death -> Soul sap -> Basic ->
---     Basic -> Death skulls -> Basic -> Touch of death -> Basic ->
---     improvise basics if not phased
---   Phase 3
---     Finger of death -> Finger of death -> Basic -> Death skulls -> Bloat ->
---     Volley of souls -> Threads of fate + target pools -> Soul sap ->
---     target Raksha + Volley of souls
---   Phase 4
---     Anti -> Soul sap -> Touch of death -> Basic -> equip Excalibur -> equip
---     Soulbound lantern + Conjure army -> Soul sap -> Command skeleton ->
---     Command ghost -> Death skulls -> Ingenuity + Roar of awakening / Ode to
---     deceit spec (0 tick) -> Divert -> Soul sap -> Split soul -> Bloat ->
---     Omniguard spec -> Basic -> Soul sap -> Command skeleton -> Volley of
---     souls -> Touch of death -> Finger of death -> Deathguard90 EOF spec ->
---     improvise if not dead
---
--- Each line ends on improviseTail(), which is Improvise with `spend = false` —
--- the guide's "improvise basics if not phased" / "improvise if not dead". The
--- rotation manager never advances past an Improvise step, so we sit on it until
--- the phase changes and the next line is loaded.
---
--- IMPORTANT: each of these MUST be a flat array of steps. RotationManager:load
--- iterates with ipairs, so a {name=, rotation={}} wrapper reads as empty and
--- silently fails to load. Buff ids: 30101 = Necrosis, 30123 = Residual Souls.
---
--- Steps whose ability the account hasn't unlocked (e.g. Split Soul) simply fail
--- and advance — useAbility returns false, the rotation moves on after its wait.
-
---- Item names for phase 4's weapon switches, in one place because the exact
---- in-game strings vary with upgrade tier. Every switch step is conditional on
---- actually carrying the item, so a name that doesn't match costs nothing but
---- that switch — the rotation flows straight past it.
 local SWITCHES = {
     excalibur = "Enhanced Excalibur",
     lantern = "Soulbound lantern",
@@ -876,26 +849,63 @@ local function fingerOfDeath(wait)
     }
 end
 
---- Volley of Souls needs 5 Residual Souls; Soul Sap is the builder to fall back
---- on when we're short.
+--- Residual Souls we insist on before spending them on a Volley.
+---
+--- NOT a requirement of the ability — Volley of Souls activates on TWO stacks
+--- and consumes whatever it finds, for 135-165% each. This is a policy, and the
+--- distinction matters because the number used to be 5 and read as though the
+--- ability demanded it.
+---
+--- 5 was the soul CAP (three by default, five while a soulbound lantern is
+--- equipped), and gating on the cap looks free — damage per soul is flat, so
+--- batching costs nothing and each Volley lands for more. What it actually cost
+--- was the casts themselves. Soul Sap is the only generator in these rotations
+--- at one soul apiece, so from an empty bar phase 1 reaches two souls at its
+--- first Volley and three at its second: BOTH failed the gate and fell through
+--- to Soul Sap, every kill, and `replacementLabel` meant that never showed up as
+--- anything going wrong. The gate wasn't wrong in principle, it was simply set
+--- above what the rotation delivers.
+---
+--- 3 is the default cap and the figure the sibling Arch-Glacor rotations in this
+--- repo already use. It clears every Volley site here except the immediate
+--- second of a back-to-back pair, which nothing can save: the first Volley
+--- empties the bar and one Soul Sap cannot refill it. Those keep falling through
+--- to Soul Sap, which is what the PVME line asks for at that position anyway.
+local VOLLEY_MIN_SOULS = 3
+
+--- Volley of Souls, with Soul Sap as the builder to fall back on when we're
+--- short — which also tops the stack up for the next attempt.
 --- @param wait? number
 --- @return table
 local function volleyOfSouls(wait)
     return {
         label = "Volley of Souls",
-        condition = function() return Player:getBuff(30123).remaining >= 5 end,
+        condition = function() return soulStacks() >= VOLLEY_MIN_SOULS end,
         replacementLabel = "Soul Sap",
         wait = wait or 3,
         useTicks = true
     }
 end
 
---- Ticks to stop the player manager drinking for around an Adrenaline renewal.
+--- Ticks to stop the player manager drinking for around the adrenaline potion.
 --- Two inventory clicks in the same tick means one of them is thrown away, and
 --- the one we lose is whichever went second.
-local ADREN_RENEWAL_DONT_DRINK = 4
+local ADREN_POTION_DONT_DRINK = 4
 
---- Adrenaline renewal, following Rasial's pattern (rasial/presets.lua).
+--- The rotation's adrenaline drink, following Rasial's pattern
+--- (rasial/presets.lua).
+---
+--- Takes whichever of the two potions in ADRENALINE_POTION_IDS you actually
+--- brought — an Adrenaline renewal or an Enhanced replenishment. The step does
+--- not branch on which: it hands the whole id list to the client and the first
+--- one present is clicked. Bring either, bring both, bring any dose.
+---
+--- What you bring is NOT neutral, though. This step exists to fund the beat
+--- below it in PHASE2_ROTATION, and that beat is written around the renewal's
+--- refund. A replenishment restoring less adrenaline still drinks correctly and
+--- still leaves the fight in a sane state — Death Skulls simply waits for the
+--- bar rather than firing off the refund — but the phase runs a little slower
+--- for it. Worth knowing before blaming the rotation.
 ---
 --- Two things matter here and both were wrong before:
 ---
@@ -916,20 +926,27 @@ local ADREN_RENEWAL_DONT_DRINK = 4
 --- pauses nothing.
 --- @param wait? number
 --- @return table
-local function adrenalineRenewal(wait)
+local function adrenalinePotion(wait)
     return {
-        label = "Adrenaline renewal",
+        label = "Adrenaline potion",
         type = "Custom",
         -- Still guarded, so we never burn the potion on a full bar — but by this
         -- point Living Death has just emptied it, so it passes.
+        --
+        -- Also guarded on actually HAVING one. Without this the step reports
+        -- failure every attempt on a bag that ran out, which reads in the log
+        -- exactly like a click that keeps missing.
         condition = function()
+            if not Inventory:Contains(ADRENALINE_POTION_IDS) then return false end
             return API.GetAdrenalineFromInterface() < 100
         end,
         action = function()
-            playerManager:dontDrink(ADREN_RENEWAL_DONT_DRINK)
-            -- The same call RotationManager's "Inventory" step type makes; done
-            -- here so the don't-drink pause and the click are one step.
-            return API.DoAction_Inventory3("Adrenaline renewal", 0, 1,
+            playerManager:dontDrink(ADREN_POTION_DONT_DRINK)
+            -- DoAction_Inventory2, not ...3: the by-NAME variant can only ever
+            -- name one potion, which is what tied this step to the renewal. The
+            -- id-array variant takes both potions and every dose of each in a
+            -- single call, so nothing here has to know what you brought.
+            return API.DoAction_Inventory2(ADRENALINE_POTION_IDS, 0, 1,
                                            API.OFF_ACT_GeneralInterface_route)
         end,
         wait = wait or 3,
@@ -969,15 +986,8 @@ local FIGHT_ROTATION = {
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
     {label = "Surge", wait = 3, useTicks = true},
-    {label = "Surge", wait = 2, useTicks = true},
-
-    -- --- PVME "Inside instance" ---------------------------------------------
-    -- Conjure army -> Life transfer -> Command ghost.
-    --
-    -- The lobby normally summons the army before we walk through the gate, in
-    -- which case conjureArmy() skips straight through — but it stays here so a
-    -- summon that failed in the lobby is still made before the fight starts.
-    conjureArmy(4),
+    {label = "Surge", wait = 1, useTicks = true},
+    {label = "Invoke Lord of Bones", wait = 2, useTicks = true},
     {label = "Life Transfer", wait = 2, useTicks = true},
     {label = "Command Vengeful Ghost", wait = 2, useTicks = true},
     {
@@ -1005,26 +1015,14 @@ local FIGHT_ROTATION = {
             ---@diagnostic disable-next-line: undefined-global
             --return API.DoAction_WalkerW(WPOINT.new(hx, hy, hz))
         end,
-        wait = 2,
+        wait = 0,
         useTicks = true
     },
-
-    -- --- PVME PHASE 1 -------------------------------------------------------
-    -- Surge + Invoke death -> Command skeleton -> Split soul + Vuln bomb under
-    -- Raksha -> tc + Bloat -> Death skulls -> Volley of souls -> Soul sap ->
-    -- Divert -> Touch of death -> Soul sap -> Command skeleton
-    --
-    -- Ruination is NOT cast anywhere in here: it's in BUFFS, so the player
-    -- manager turns it on and, crucially, back off after the kill. Casting it
-    -- from both places races the activation delay and toggles it off again.
-    {label = "Invoke Death", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
-
-    -- "Split soul + Vuln bomb under Raksha" — the bomb is thrown at whatever
-    -- we're targeting, so acquiring him first is what puts it under him.
-    targetRaksha(1),
     {label = "Split Soul", wait = 2, useTicks = true},
-        {
+    {label = "Invoke Death", wait = 2, useTicks = true},
+    targetRaksha(1),
+    {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
@@ -1035,13 +1033,19 @@ local FIGHT_ROTATION = {
     -- "tc + Bloat": re-acquire Raksha, then open the damage.
     targetRaksha(1),
     {label = "Bloat", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
-    volleyOfSouls(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Divert", wait = 4, useTicks = true},
     {label = "Touch of Death", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 5, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
+    volleyOfSouls(3),
 
     -- Phase 1 runs out into this only if he survives the scripted opener; the
     -- phase 2 rotation replaces the whole thing on transition.
@@ -1071,8 +1075,10 @@ local PHASE2_ROTATION = {
     -- Living Death takes 5 ticks to land before the next ABILITY, but a potion
     -- is an inventory action and off the global cooldown, so it slots into that
     -- window rather than extending it: 1 + 4 keeps Touch of Death where it was.
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Living Death", wait = 3, useTicks = true},
-    adrenalineRenewal(4),
+    adrenalinePotion(4),
     {label = "Touch of Death", wait = 3, useTicks = true},
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
@@ -1089,10 +1095,16 @@ local PHASE2_ROTATION = {
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    conjureArmy(2),
+    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Touch of Death", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    volleyOfSouls(3),
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    volleyOfSouls(3),
 
     -- "improvise basics if not phased"
     improviseTail()
@@ -1181,7 +1193,7 @@ local PHASE4_ROTATION = {
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
     {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
-    adrenalineRenewal(4),
+    adrenalinePotion(4),
             {
         label = "Vulnerability bomb",
         type = "Inventory",
@@ -1189,6 +1201,10 @@ local PHASE4_ROTATION = {
         useTicks = true,
         setupBoundary = true
     },
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
     
     -- "Ingenuity + Roar of awakening / Ode to deceit spec (0 tick)": Ingenuity
@@ -1321,7 +1337,7 @@ end
 ---
 --- Either way a click cap plus pacing applies, so no signal — stuck true, or
 --- lingering after the button is gone — can turn into a click loop.
-local SPECIAL_ACTION_BUFF = 45036
+local SPECIAL_ACTION_BUFF = 12171
 local SPECIAL_ACTION_MAX_CLICKS = 3 -- hard cap per buff window
 local SPECIAL_ACTION_RETRY_TICKS = 2 -- pacing between retries
 

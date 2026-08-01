@@ -426,7 +426,16 @@ function WarsRetreat:_initializeData()
         _presetValidated = false,
         -- Altar visits made during THIS stay at War's Retreat. Cleared on
         -- leaving — see _syncTripState.
-        altarVisits = 0
+        altarVisits = 0,
+        -- Tick the pray interaction went out, while a visit is in flight. Non
+        -- nil means "still waiting on the altar" — see _checkAltarCondition.
+        altarPrayTick = nil,
+        -- Consecutive interactions that never went out, and which object they
+        -- were against — see _recoverFailedInteract.
+        interactFails = {what = nil, count = 0},
+        -- Per-tick _getCurrentStep() memo — see _getCurrentStep.
+        _stepCache = nil,
+        _stepCacheTick = -1
     }
     self:_rollAdvancedMovement()
     Utils:log("Data initialization completed", "info")
@@ -490,6 +499,11 @@ function WarsRetreat:_syncTripState(here)
     if here or not self.variables then return end
     self.variables.altarVisits = 0
     self.variables.bankAttempts = 0
+    -- Any altar visit still in flight died with the trip.
+    self.variables.altarPrayTick = nil
+    self:_clearInteractFails()
+    self.variables._stepCache = nil
+    self.variables._stepCacheTick = -1
 end
 
 --- Checks if player is at War's Retreat
@@ -552,6 +566,57 @@ function WarsRetreat:goThroughBossPortal()
 end
 ---@diagnostic enable
 
+--- Handles an interaction that never actually went out.
+---
+--- Interact:Object returns false when the client's object scan cannot find the
+--- object near us — "DoAction_Object_r:nothing at tile" in the log. Two things
+--- then have to happen or the script simply stops dead:
+---
+---   * We have to MOVE. The scan failing means we are not close enough, and
+---     retrying from the same tile fails identically forever. Nothing else
+---     moves us either: _navigateToBank and _navigateForAltar both check a 30
+---     tile range, which covers the whole of War's Retreat, so they consider us
+---     "in range" from the moment we arrive and never walk us anywhere.
+---
+---   * The task has to report SUCCESS. Timer:_execute only starts a task's
+---     cooldown when the action returns true, so returning false re-fires the
+---     task on every single loop iteration. Each of those iterations re-runs
+---     _getCurrentStep() and with it a full inventory comparison, which is
+---     where the wall of "Unexpected inventory size" came from — and because no
+---     click ever reached the game, the account idled out while the script
+---     looked busy.
+---
+--- Returning true here is therefore the fix, not a lie: walking IS the action.
+--- @param tile WPOINT Tile to walk to
+--- @param what string Name of the object, for the log
+--- @return boolean Always true, so the caller's cooldown engages
+--- @private
+function WarsRetreat:_recoverFailedInteract(tile, what)
+    local fails = self.variables.interactFails
+
+    -- The streak is per object. Switching targets ends the previous streak, and
+    -- carrying it over would spend one step's patience on another's behalf.
+    if fails.what ~= what then
+        fails.what = what
+        fails.count = 0
+    end
+    fails.count = fails.count + 1
+
+    self.lastAction = "Walking to " .. what
+    Utils:log(string.format(
+                  "%s interaction did not go out (%d in a row) — walking to it and retrying",
+                  what, fails.count), "warn")
+
+    if not Player:isMoving() then API.DoAction_WalkerW(tile) end
+    return true
+end
+
+--- Ends the current failed-interaction streak.
+--- @private
+function WarsRetreat:_clearInteractFails()
+    self.variables.interactFails.what = nil
+    self.variables.interactFails.count = 0
+end
 
 --- Resets all War's Retreat variables
 function WarsRetreat:reset()
@@ -562,6 +627,10 @@ function WarsRetreat:reset()
     variables.positioning = false
     variables._presetValidated = false
     variables.altarVisits = 0
+    variables.altarPrayTick = nil
+    self:_clearInteractFails()
+    variables._stepCache = nil
+    variables._stepCacheTick = -1
     self.warnings = {}
 
     self:_rollAdvancedMovement()
@@ -665,7 +734,15 @@ function WarsRetreat:_createTimerTasks()
             end,
             action = function()
                 self.lastAction = "Loading last preset"
-                return self:loadLastPreset()
+
+                if not self:loadLastPreset() then
+                    return self:_recoverFailedInteract(
+                               self.constants.TILES.POSITIONING,
+                               self.constants.OBJECTS.BANK_CHEST.name)
+                end
+
+                self:_clearInteractFails()
+                return true
             end,
             load = true
         }, -- Task: Pray at Altar of War
@@ -679,14 +756,31 @@ function WarsRetreat:_createTimerTasks()
                            (self:_getCurrentStep() == "USE ALTAR")
             end,
             action = function()
+                -- Never re-issue over our own prayer animation — that is the
+                -- restore happening, and clicking through it starts the
+                -- interaction again from scratch.
+                if Player:getAnimation() ==
+                    self.constants.IDS.PRAY_AT_ALTAR_ANIMATION then
+                    return false
+                end
+
                 self.lastAction = "Using Altar of War"
-                local prayed = self:prayAtAltarOfWar()
+
+                if not self:prayAtAltarOfWar() then
+                    return self:_recoverFailedInteract(
+                               self.constants.TILES.ALTAR,
+                               self.constants.OBJECTS.ALTAR_OF_WAR.name)
+                end
+
+                self:_clearInteractFails()
                 -- Counts the visit only when the interaction actually went out,
                 -- so a failed click doesn't spend our one trip to the altar.
-                if prayed then
-                    self.variables.altarVisits = self.variables.altarVisits + 1
-                end
-                return prayed
+                self.variables.altarVisits = self.variables.altarVisits + 1
+                -- Opens the wait window. _checkAltarCondition holds the step
+                -- here until the prayer lands or the wait times out.
+                self.variables.altarPrayTick = self.variables.altarPrayTick or
+                                                   API.Get_tick()
+                return true
             end,
             delay = 300,
             delayTicks = false,
@@ -912,6 +1006,61 @@ end
 --- attempt counter and terminated the script.
 local ALTAR_MAX_VISITS = 1
 
+--- Prayer reading that counts as a finished restore. The altar tops prayer up in
+--- full, so anything short of this means the prayer has not landed yet.
+local ALTAR_PRAYER_FULL = 100
+
+--- Ticks a visit is given before its result is believed at all.
+---
+--- prayAtAltarOfWar() only SENDS the interaction — the walk across War's Retreat
+--- and the prayer animation both still have to happen. Reading prayer straight
+--- after the click reads the value we already had.
+local ALTAR_MIN_TICKS = 5
+
+--- Ticks after which we stop waiting on the altar and carry on regardless.
+---
+--- The visit can legitimately never complete: the click can be eaten, the walk
+--- can be interrupted, and prayer can sit a point below full. Starting a kill
+--- slightly short is trivial next to standing at the altar for the rest of the
+--- session, so the wait is bounded.
+local ALTAR_TIMEOUT_TICKS = 30
+
+--- Failed pray interactions before the altar is written off for this trip.
+---
+--- ALTAR_TIMEOUT_TICKS only bounds a visit that STARTED — it keys off
+--- altarPrayTick, which is never stamped when the click doesn't go out at all.
+--- An altar the object scan can't find would otherwise loop here forever, and
+--- the altar is the one step we can do without: the points check carries us on
+--- to the bank and the portal regardless.
+local ALTAR_MAX_INTERACT_FAILS = 3
+
+--- Whether the altar visit currently in flight has finished.
+---
+--- PRAYER, and only prayer, is the completion signal. It is what the altar is
+--- for and it is restored in full, so it reads unambiguously. Summoning is
+--- deliberately not part of this: getSummoningPointsPercent() FLOORS, so the
+--- default minimum of 100 sits at 99 on a single point of drift — as a trigger
+--- that costs one wasted altar trip, but as a completion gate it would pin us
+--- here until the timeout on every single kill.
+--- @return boolean
+--- @private
+function WarsRetreat:_altarVisitDone()
+    local elapsed = API.Get_tick() - self.variables.altarPrayTick
+
+    if elapsed < ALTAR_MIN_TICKS then return false end
+
+    if Player:getPrayerPercent() >= ALTAR_PRAYER_FULL then return true end
+
+    if elapsed >= ALTAR_TIMEOUT_TICKS then
+        Utils:log(string.format(
+                      "Altar did not restore prayer within %d ticks (at %d%%) — moving on",
+                      ALTAR_TIMEOUT_TICKS, Player:getPrayerPercent()), "warn")
+        return true
+    end
+
+    return false
+end
+
 --- Checks if altar is needed. Returns step string or nil.
 ---
 --- Points are the ONLY reason to go. If prayer and summoning are both topped up,
@@ -941,7 +1090,28 @@ local ALTAR_MAX_VISITS = 1
 function WarsRetreat:_checkAltarCondition()
     local minimums = self.userSettings.minimumValues
 
+    -- A visit already under way OWNS the step until the prayer actually lands.
+    --
+    -- This is the whole reason the altar used to do nothing. altarVisits was
+    -- incremented the moment the click went OUT, which immediately took this
+    -- check to its cap and handed the step on — so navigation walked us off to
+    -- the bank while we were still on our way to the altar, and we reached the
+    -- portal on whatever prayer the last kill left us.
+    if self.variables.altarPrayTick then
+        if not self:_altarVisitDone() then return "USE ALTAR" end
+        self.variables.altarPrayTick = nil
+        return nil
+    end
+
     if self.variables.altarVisits >= ALTAR_MAX_VISITS then return nil end
+
+    -- An altar we cannot get a click into is written off rather than retried
+    -- forever. See ALTAR_MAX_INTERACT_FAILS.
+    local fails = self.variables.interactFails
+    if fails.what == self.constants.OBJECTS.ALTAR_OF_WAR.name and fails.count >=
+        ALTAR_MAX_INTERACT_FAILS then
+        return nil
+    end
 
     if (Player:getPrayerPercent() < minimums.prayer) or
         (Player:getSummoningPointsPercent() < minimums.summoning) then
@@ -1013,10 +1183,35 @@ end
 ------------------------------------------
 
 --- Returns the appropriate step based on user-defined task order
+---
+--- Memoised per game tick. Every War's Retreat task calls this from its
+--- CONDITION, and Timer:run() evaluates every condition at the top of each
+--- cycle, so one pass used to resolve the step five or six times over — and
+--- _checkLoadPresetCondition walks the whole preset with two container reads per
+--- item id every time it is asked. That is the actual source of the "Unexpected
+--- inventory size" wall in the log: not one broken read, but the same handful of
+--- reads repeated at loop speed. Answering once per tick collapses it without
+--- changing a single decision, since nothing the checks read moves faster than
+--- the game clock anyway.
 --- @return string Step name indicating the current action to be taken
 function WarsRetreat:_getCurrentStep()
     if not self:atLocation() then return "UNKNOWN" end
 
+    local tick = API.Get_tick()
+    if self.variables._stepCacheTick == tick and self.variables._stepCache then
+        return self.variables._stepCache
+    end
+
+    local step = self:_resolveCurrentStep()
+    self.variables._stepCache = step
+    self.variables._stepCacheTick = tick
+    return step
+end
+
+--- Works out the current step from scratch. Call _getCurrentStep, not this.
+--- @return string
+--- @private
+function WarsRetreat:_resolveCurrentStep()
     -- Refresh buff cache for this tick
     self:_updateBuffCache()
 
