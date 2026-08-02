@@ -130,12 +130,55 @@ Constants.SHADOW_FLOOR = {
 -- # PHASES
 ------------------------------------------
 
---- Solo HP thresholds (wiki). Phase drives how aggressively we clear pools:
+--- SOLO HP thresholds (wiki). Phase drives how aggressively we clear pools:
 ---   P1 800k-600k  Raksha does NOT siphon pools yet — pure DPS, ignore them
 ---   P2 600k-400k  Energy waves start; he siphons, so pools must die
 ---   P3 400k-200k  8 pools per sweep and he siphons after EVERY special
 ---   P4 200k-0     Antechamber; shadow detonation dome
-Constants.PHASE_HP = {P2 = 600000, P3 = 400000, P4 = 200000}
+---
+--- These are the BASE values. Constants.PHASE_HP is rebuilt from them by
+--- setPartySize, so read PHASE_HP everywhere and never these directly.
+Constants.PHASE_HP_SOLO = {P2 = 600000, P3 = 400000, P4 = 200000}
+
+--- Live thresholds, scaled for the party we are actually in. Starts at solo.
+Constants.PHASE_HP = {
+    P2 = Constants.PHASE_HP_SOLO.P2,
+    P3 = Constants.PHASE_HP_SOLO.P3,
+    P4 = Constants.PHASE_HP_SOLO.P4
+}
+
+--- Players the thresholds are currently scaled for.
+Constants.partySize = 1
+
+--- Rescales the phase thresholds for a party of `size`.
+---
+--- Raksha's life points scale exactly with the party: 800,000 solo, 1,600,000
+--- in a duo, and the wiki's strategy page confirms every transition doubles with
+--- them — phases at 1.2M / 800k / 400k rather than 600k / 400k / 200k. The
+--- enrage heal follows the same rule: he returns to phase 3's starting health,
+--- which is 400k solo and 800k duo.
+---
+--- Getting this wrong is not a cosmetic reporting error. mechanics.getPhase
+--- derives the phase from these numbers, and the phase decides which rotation is
+--- loaded and which mechanic definitions apply — so a duo fight read against
+--- solo thresholds sits in "phase 4" for most of the kill, loading the phase 4
+--- rotation and its overrides against a boss still in phase 1.
+---
+--- Mutates the SAME table rather than replacing it, because constants.lua is
+--- required once and other modules hold a reference to Constants.PHASE_HP.
+--- @param size number Players in the instance (1 = solo, 2 = duo)
+function Constants.setPartySize(size)
+    size = math.max(math.floor(tonumber(size) or 1), 1)
+
+    Constants.partySize = size
+    Constants.PHASE_HP.P2 = Constants.PHASE_HP_SOLO.P2 * size
+    Constants.PHASE_HP.P3 = Constants.PHASE_HP_SOLO.P3 * size
+    Constants.PHASE_HP.P4 = Constants.PHASE_HP_SOLO.P4 * size
+
+    -- Reassigned rather than mutated: this one is a number, and every reader
+    -- looks it up through Constants at call time.
+    Constants.LUCK_RING_HP = Constants.LUCK_RING_HP_SOLO * size
+end
 
 --- Phase 4 is a different, smaller arena and Raksha heals back to 400k on entry
 --- — which reads as phase 3 on HP alone, so the phase is LATCHED and only ever
@@ -181,7 +224,13 @@ Constants.SIPHON_CHAT = "anchors you to the shadows"
 
 --- HP at which we swap in the luck ring, so the drop rolls with it. Phase 4
 --- only — he sits above this for most of the fight.
-Constants.LUCK_RING_HP = 50000
+---
+--- Scaled with the party by setPartySize, like the phase thresholds. Left at a
+--- flat 50,000 it would be half the warning it is meant to be in a duo, where
+--- phase 4 starts at 800,000 rather than 400,000 — the ring would go on with
+--- proportionally half as much fight left to spare.
+Constants.LUCK_RING_HP_SOLO = 50000
+Constants.LUCK_RING_HP = Constants.LUCK_RING_HP_SOLO
 
 ------------------------------------------
 -- # ARENA

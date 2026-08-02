@@ -39,6 +39,18 @@ RakshaGUI.config = {
     waitForFullHp = true,
     useRevolution = false,
 
+    -- Party / duo. Modelled on kerapac/config.lua, which uses the same three
+    -- settings: are we in a party at all, are we the one who owns the instance,
+    -- and who is the owner if it isn't us.
+    --
+    -- inParty is what scales Raksha's phase thresholds — he has double the life
+    -- points in duo and every transition doubles with them, so getting this
+    -- wrong does not just misreport a number, it puts the whole phase machine
+    -- on the wrong rotation. See Constants.setPartySize.
+    inParty = false,
+    isPartyLeader = false,
+    partyLeader = "",
+
     -- Health thresholds (percent). Set high for Raksha: anima clouds ramp to
     -- 2,000 a tick, pools are ~1,500 a tick and a countered shadow bomb still
     -- lands ~6,000, so eating at 45% left no room to react.
@@ -214,6 +226,9 @@ local function saveConfigToFile(cfg)
         BankPin = cfg.bankPin,
         WaitForFullHp = cfg.waitForFullHp,
         UseRevolution = cfg.useRevolution,
+        InParty = cfg.inParty,
+        IsPartyLeader = cfg.isPartyLeader,
+        PartyLeader = cfg.partyLeader,
         HealthSolid = cfg.healthSolid,
         HealthJellyfish = cfg.healthJellyfish,
         HealthPotion = cfg.healthPotion,
@@ -342,6 +357,10 @@ function RakshaGUI.loadConfig()
     bool("WaitForFullHp", "waitForFullHp")
     bool("UseRevolution", "useRevolution")
 
+    bool("InParty", "inParty")
+    bool("IsPartyLeader", "isPartyLeader")
+    str("PartyLeader", "partyLeader")
+
     num("HealthSolid", "healthSolid")
     num("HealthJellyfish", "healthJellyfish")
     num("HealthPotion", "healthPotion")
@@ -391,6 +410,17 @@ function RakshaGUI.getConfig()
         waitForFullHp = c.waitForFullHp,
         useRevolution = c.useRevolution,
         usePrebuild = c.usePrebuild,
+
+        party = {
+            inParty = c.inParty,
+            -- Only meaningful inside a party. Resolved here rather than at every
+            -- call site so nothing downstream has to remember the combination.
+            isLeader = c.inParty and c.isPartyLeader or false,
+            leaderName = c.partyLeader or "",
+            -- Two in a duo, one otherwise. This is the number the phase
+            -- thresholds scale on.
+            size = c.inParty and 2 or 1
+        },
 
         playerManager = {
             health = {
@@ -475,6 +505,42 @@ local function drawGeneralTab(cfg)
     else
         ui:text("The script casts the full scripted rotation itself. Turn this " ..
                     "on to hand damage over to a full Revolution bar instead.",
+                "hint")
+    end
+
+    ui:separator()
+    ui:sectionHeader("Party", "Solo or duo, and who owns the instance.")
+
+    cfg.inParty = ui:checkbox("Duo (in a party)##inparty", cfg.inParty)
+
+    if not cfg.inParty then
+        ui:text("Solo. Raksha has 800,000 life points and phases at 600k, " ..
+                    "400k and 200k.", "hint")
+        return
+    end
+
+    ui:text("Duo. Raksha has 1,600,000 life points and phases at 1.2M, 800k " ..
+                "and 400k — every threshold doubles, so this must match the " ..
+                "instance you are actually in or the phase rotations load at " ..
+                "the wrong time.", "hint")
+
+    ui:spacing(1)
+    cfg.isPartyLeader = ui:checkbox("I own the instance##ispartyleader",
+                                    cfg.isPartyLeader)
+
+    if cfg.isPartyLeader then
+        ui:text("You create the instance and set it to 2 players. Your partner " ..
+                    "joins you by name.", "hint")
+        return
+    end
+
+    cfg.partyLeader = ui:labeledInput("Owner's name", "##partyleader",
+                                      cfg.partyLeader)
+    if cfg.partyLeader == nil or cfg.partyLeader == "" then
+        ui:statusText("Owner's name required to join their instance", "warning",
+                      true)
+    else
+        ui:text("You join this player's instance rather than creating one.",
                 "hint")
     end
 end

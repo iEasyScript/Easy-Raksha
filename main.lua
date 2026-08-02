@@ -336,6 +336,16 @@ CONFIG.scriptVersion = SCRIPT_VERSION
 -- inventory no longer matches this list, so an EMPTY LOADOUT means no banking.
 CONFIG.preset = {inventory = LOADOUT, equipment = {}}
 
+-- Scale the phase thresholds for the party we are actually in, BEFORE anything
+-- reads them. Raksha has double the life points in a duo and every transition
+-- doubles with them, so this decides which rotation loads when — see
+-- Constants.setPartySize.
+Constants.setPartySize(CONFIG.party.size)
+Utils:log(string.format(
+              "%s: Raksha phases at %d / %d / %d",
+              CONFIG.party.inParty and "DUO" or "Solo", Constants.PHASE_HP.P2,
+              Constants.PHASE_HP.P3, Constants.PHASE_HP.P4), "info")
+
 -- Push the tunable mechanic values from the GUI onto the constants the
 -- mechanics module reads.
 do
@@ -1642,7 +1652,11 @@ local RakshaFight = {
         specialActionScanWorks = false, -- Latched once the 743 scan sees the button
         transitionHolding = false, -- True while sitting out the phase 4 transition
         transitionEndTick = nil, -- Tick the transition animation stopped
-        transitionReattacked = false -- Raksha re-targeted during the grace window
+        transitionReattacked = false, -- Raksha re-targeted during the grace window
+        -- Duo only: consecutive GAME TICKS with no partner visible, and the tick
+        -- that streak last counted on. See RakshaFight:partnerMissingTicks.
+        partnerMissingStreak = 0,
+        lastPartnerCheckTick = nil
     }
 }
 
@@ -1818,6 +1832,13 @@ local INSTANCE_TIMEOUT = 30
 local INSTANCE_INTERFACE = 1591
 local INSTANCE_CONFIRM_COMPONENT = 56
 
+--- "Max players" field on the same settings panel.
+---
+--- Component id taken from kerapac/KerapacPreparation.lua:HandleSetupInstance,
+--- which drives interface 1591 in production — the same panel this script
+--- confirms through component 56, so the ids belong to the same layout.
+local INSTANCE_MAX_PLAYERS_COMPONENT = 68
+
 --- Varbit holding when the current instance EXPIRES, as an absolute count of
 --- minutes since the epoch. Zero/absent means we have no instance.
 ---
@@ -1853,6 +1874,10 @@ local RakshaLobby = {
         -- Short post-creation latch (see INSTANCE_CREATE_GRACE), NOT an age
         -- tracker — varbit 9925 owns the age.
         instanceCreatedAt = 0,
+        -- Duo leader only: whether the max-players field has been set on the
+        -- settings panel currently open. Cleared on confirm, so each new
+        -- instance sets its own size.
+        instanceSizeSet = false,
         rejoinAttempts = 0, -- consecutive rejoin tries this trip
         lastInstanceAttempt = 0, -- os.clock() of the pending new-instance attempt
         instanceAttemptCount = 0, -- consecutive new-instance timeouts
@@ -1924,6 +1949,31 @@ function RakshaLobby:startNewInstance()
     end
 
     if instanceInterfaceOpen() then
+        -- DUO LEADER: widen the instance before confirming it.
+        --
+        -- Has to happen on the CREATE. A solo instance has no second slot to
+        -- give away later, so a partner trying to join one is simply refused —
+        -- there is no recovering from this after the confirm click.
+        --
+        -- Latched, and returns false rather than falling through to the confirm:
+        -- the size field needs a pass to take, and confirming in the same pass
+        -- would bank whatever was in the box before we typed.
+        if CONFIG.party.isLeader and not self.variables.instanceSizeSet then
+            self.variables.instanceSizeSet = true
+            Utils:log(string.format("Duo: setting instance size to %d players",
+                                    CONFIG.party.size))
+
+            ---@diagnostic disable-next-line:missing-parameter
+            API.DoAction_Interface(0x24, 0xffffffff, 1, INSTANCE_INTERFACE,
+                                   INSTANCE_MAX_PLAYERS_COMPONENT, -1,
+                                   API.OFF_ACT_GeneralInterface_route)
+            API.Sleep_tick(2)
+            API.KeyboardPress(CONFIG.party.size, 60, 110)
+            API.KeyboardPress2(0x0D, 60, 110) -- Enter
+            API.Sleep_tick(2)
+            return false
+        end
+
         ---@diagnostic disable-next-line:missing-parameter
         if API.DoAction_Interface(0x24, 0xffffffff, 1, INSTANCE_INTERFACE,
                                   INSTANCE_CONFIRM_COMPONENT, -1,
@@ -1932,6 +1982,7 @@ function RakshaLobby:startNewInstance()
             self.variables.lastInstanceAttempt = 0
             self.variables.instanceAttemptCount = 0
             self.variables.rejoinAttempts = 0
+            self.variables.instanceSizeSet = false
             self.variables.instanceCreatedAt = os.clock()
             return true
         end
@@ -1949,6 +2000,129 @@ function RakshaLobby:startNewInstance()
     ---@diagnostic disable-next-line
     return Interact:Object(gate.name, gate.action)
 end
+
+--- Joins the party owner's instance instead of making one of our own.
+---
+--- Ported from kerapac/KerapacPreparation.lua, whose non-leader branch does the
+--- same two steps against the Colosseum gateway: right-click the entrance with
+--- the join offset, then type the owner's name into the prompt that opens.
+---
+--- THE OFFSET IS THE UNVERIFIED PART. 0x29 with OFF_ACT_GeneralObject_route1 is
+--- Kerapac's join action on ITS gateway; Raksha's Security gate is a different
+--- object and its options are only documented here for "Enter" and "Rejoin last
+--- instance". If joining silently does nothing, this pair is what to correct —
+--- the log line below fires either way so the attempt is visible.
+--- @return boolean sent
+function RakshaLobby:joinLeaderInstance()
+    local gate = Constants.OBJECTS.SECURITY_GATE
+    local leader = CONFIG.party.leaderName
+
+    if leader == nil or leader == "" then
+        Utils:log("Duo: no party owner name configured — cannot join", "error")
+        return false
+    end
+
+    Utils:log(string.format("Duo: joining %s's instance", leader))
+
+    local clicked = API.DoAction_Object1(0x29, API.OFF_ACT_GeneralObject_route1,
+                                         {gate.id}, 50)
+    if not clicked then
+        Utils:log("Duo: join click did not go out — retrying", "warn")
+        return false
+    end
+
+    -- TYPE STRAIGHT AFTER THE CLICK, without waiting for a dialogue.
+    --
+    -- The first version gated this on API.Check_Dialog_Open() and never typed a
+    -- character, which is the bug: the name prompt is a text-entry interface,
+    -- not the dialogue that check reports on, so the gate was never satisfied
+    -- and we just re-clicked the gate forever.
+    --
+    -- Kerapac's HandleJoinPlayer does not check anything either — it clicks,
+    -- sleeps a tick and types. That version works in production, so this one
+    -- follows it rather than being clever.
+    API.Sleep_tick(2)
+
+    -- Uppercased, and sent as a "0x41" STRING rather than the number 65.
+    -- Numerically identical, and the number is what KeyboardPress2 is annotated
+    -- to take — but the string is the form Kerapac has been using successfully,
+    -- and this is not the place to find out whether the native treats them the
+    -- same. The annotation is silenced instead.
+    --
+    -- Virtual-key codes for A-Z and 0-9 equal their uppercase ASCII values,
+    -- which is why the uppercase matters. It does not hold for every
+    -- punctuation mark, so a name with a hyphen may not type cleanly.
+    local upper = string.upper(leader)
+    for i = 1, #upper do
+        -- Bail the moment we are actually inside. Kerapac checks this between
+        -- every keystroke, and the reason is worth keeping: if the join lands
+        -- part way through the name, the remaining characters go somewhere else
+        -- entirely — the chat box, most likely.
+        if API.InInstancedArea() then
+            Utils:log("Duo: joined mid-type, stopping", "debug")
+            return true
+        end
+
+        local hex = string.format("%02X", string.byte(upper, i))
+        ---@diagnostic disable-next-line: param-type-mismatch
+        API.KeyboardPress2("0x" .. hex, 60, 110) -- types username char by char
+    end
+
+    if API.InInstancedArea() then return true end
+
+    -- Enter, on the LONGER timings Kerapac uses for this key specifically
+    -- (120/180 against 60/110 for the characters) and a 4 tick settle after. It
+    -- submits the name and the join takes a moment to resolve, so this is the
+    -- one keystroke worth giving room.
+    API.KeyboardPress2(0x0D, 120, 180) -- Enter 
+    API.Sleep_tick(6) -- settle after the join resolves
+    return true
+end
+
+--- Ticks between "still waiting for the other player" log lines.
+---
+--- The wait itself is unbounded — starting a 1,600,000 life point boss alone is
+--- worse than standing still — so it has to be visible, or a partner who never
+--- loads in looks identical to the script having hung.
+local PARTNER_WAIT_LOG_TICKS = 16
+
+--- Players in the arena besides us.
+---
+--- Same scan Kerapac uses in WaitForPartyToBeComplete: object type 2 with id 1
+--- is the player list, and each entry carries a Name.
+---
+--- Counted by "anyone who is not me" rather than matched against the owner's
+--- name, and deliberately so. Only party members can be inside the instance, so
+--- presence is already proof of identity — and the LEADER never learns the
+--- partner's name anyway, since the settings only capture the owner's. A name
+--- match would work for the joiner and be unimplementable for the leader.
+--- @return number
+local function otherPlayersHere()
+    local players = API.GetAllObjArray1({1}, 30, {2})
+    if not players then return 0 end
+
+    local me = API.GetLocalPlayerName()
+    local count = 0
+
+    for _, player in ipairs(players) do
+        local name = player and player.Name
+        if type(name) == "string" and name ~= "" and name ~= me then
+            count = count + 1
+        end
+    end
+
+    return count
+end
+
+--- Ticks with no partner in sight before we accept they are gone and bail out.
+---
+--- Generous on purpose. A death removes them instantly, so a shorter window
+--- would work for the case this exists for — but the phase 4 transition moves
+--- both players into the antechamber, and a partner mid-transit can read as
+--- absent for a stretch through no fault of theirs. Leaving a live fight because
+--- of a scan gap costs a kill; taking fifteen seconds to notice a real death
+--- costs almost nothing, because the fight is already lost at that point.
+local PARTNER_GONE_TICKS = 25
 
 --- Re-enters the live instance without resetting its timer.
 --- @return boolean
@@ -1979,6 +2153,17 @@ function RakshaLobby:handleInstance()
             end
             self.variables.lastInstanceAttempt = 0
         end
+    end
+
+    -- DUO, AND WE ARE NOT THE OWNER: we never create anything.
+    --
+    -- Checked before every other branch, including the mid-flow one below. A
+    -- joiner has no instance of its own to rejoin and no settings panel to
+    -- confirm — the only thing it should ever do at the gate is join the owner,
+    -- and letting it fall through to startNewInstance would build a SECOND
+    -- instance next to the one it was supposed to enter.
+    if CONFIG.party.inParty and not CONFIG.party.isLeader then
+        return self:joinLeaderInstance()
     end
 
     -- ALREADY MID-FLOW: finish what we started.
@@ -2050,6 +2235,9 @@ function RakshaFight:reset()
     self.variables.transitionEndTick = nil
     self.variables.transitionReattacked = false
     self.variables.sawPhase4Hp = false
+    self.variables.partnerWaitLogged = nil
+    self.variables.partnerMissingStreak = 0
+    self.variables.lastPartnerCheckTick = nil
     -- specialActionScanWorks is deliberately NOT reset: it records that the
     -- interface scan can see this button on this client, which stays true
     -- between kills. Clearing it would drop us back to the buff fallback at the
@@ -2069,6 +2257,29 @@ function RakshaFight:reset()
     RakshaLobby.variables.rejoinAttempts = 0
     RakshaLobby.variables.lastInstanceAttempt = 0
     RakshaLobby.variables.instanceAttemptCount = 0
+end
+
+--- Consecutive GAME TICKS with no party member visible in the arena.
+---
+--- Counted per TICK, not per call, for the same reason deadStreak is: this runs
+--- a dozen or more times a tick, so counting calls would turn a fifteen second
+--- confirmation window into about one.
+--- @return number
+function RakshaFight:partnerMissingTicks()
+    local tick = API.Get_tick()
+    if tick == self.variables.lastPartnerCheckTick then
+        return self.variables.partnerMissingStreak
+    end
+    self.variables.lastPartnerCheckTick = tick
+
+    if otherPlayersHere() > 0 then
+        self.variables.partnerMissingStreak = 0
+    else
+        self.variables.partnerMissingStreak =
+            self.variables.partnerMissingStreak + 1
+    end
+
+    return self.variables.partnerMissingStreak
 end
 
 --- True once we've spent LOOT_TIMEOUT_TICKS trying to clear the pile. Lets the
@@ -2293,6 +2504,29 @@ function RakshaFight:handleFight()
     -- engaged, so the pre-fight setup (Invoke Death, Surge, Vengeance, conjure
     -- commands) runs first — like Rasial.
     if not self.variables.engaged then
+        -- DUO: hold the opener until our partner is actually in here with us.
+        --
+        -- FIGHT_ROTATION opens with Vengeance, Darkness and two Surges — it
+        -- commits us to the safespot and starts the fight. Running that while
+        -- the second player is still at the gate means soloing the opening of a
+        -- boss with double the life points, on a rotation written for two.
+        --
+        -- Returns out of the whole pass rather than just skipping the load.
+        -- Safe here specifically because Raksha is DORMANT until something wakes
+        -- him: nothing is attacking us while we wait, so there is no prayer,
+        -- food or mechanic work being missed. The moment we engage, the normal
+        -- pass resumes and all of it comes back.
+        if CONFIG.party.inParty and otherPlayersHere() < 1 then
+            local tick = API.Get_tick()
+            if (tick - (self.variables.partnerWaitLogged or -99)) >=
+                PARTNER_WAIT_LOG_TICKS then
+                self.variables.partnerWaitLogged = tick
+                Utils:log("Duo: waiting for the other player to enter the arena",
+                          "warn")
+            end
+            return true
+        end
+
         Utils:log("----- INSTANCE ENTERED: pre-fight setup -----")
         self.variables.engaged = true
         rotationManager:load(activeRotation())
@@ -2462,6 +2696,60 @@ end
 
 RakshaFight.tasks = {
     {
+    -- DUO: our partner is gone, so we leave too and both reset together.
+    --
+    -- A death takes them out of the instance entirely — straight to Death's
+    -- Office — so from in here "gone" and "dead" look the same, and both call
+    -- for the same answer. Raksha in a duo has 1,600,000 life points on a
+    -- rotation written for two; carrying on alone is not a fight we win, it is
+    -- a second death and a second reclaim fee.
+    --
+    -- Their side is already handled: the death recovery task reclaims at Death's
+    -- Office and teleports them to War's Retreat. This is the other half, so we
+    -- both arrive there and the normal bank-and-return flow lines us back up.
+    name = "Duo: partner gone — leaving the instance",
+    priority = 96,
+    cooldown = 5,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        if not CONFIG.party.inParty then return false end
+        if not RakshaFight:atLocation() then return false end
+
+        -- Only once the fight is actually underway. Before that the
+        -- wait-for-partner gate in handleFight owns the situation, and it waits
+        -- rather than bailing.
+        if not RakshaFight.variables.engaged then return false end
+
+        -- Boss already down: finish the trip properly. Loot is on the floor and
+        -- the teleport task will take us out once it is cleared.
+        if RakshaFight.variables.bossDead then return false end
+
+        -- WE are the one who died. Death recovery owns movement from here and
+        -- teleports us out itself; two teleport sources is how you end up
+        -- stranded in Death's Office.
+        if Common.isDead then return false end
+
+        -- Mid phase 4 transition both players are moving between arenas, which
+        -- is exactly when a partner reads as absent without being gone.
+        if RakshaFight.variables.transitionHolding then return false end
+
+        return RakshaFight:partnerMissingTicks() >= PARTNER_GONE_TICKS
+    end,
+    action = function()
+        if not Utils:useAbility("War's Retreat Teleport") then
+            Utils:log("Duo: partner gone, but the teleport did not fire — " ..
+                          "retrying", "warn")
+            return false
+        end
+
+        Utils:log(string.format(
+                      "Duo: no partner for %d ticks — teleporting to War's Retreat to reset",
+                      RakshaFight.variables.partnerMissingStreak), "warn")
+        RakshaFight:reset()
+        return true
+    end
+    }, {
         -- Safety net: being at War's Retreat means the trip is over, so the
         -- fight state must be clear. Nothing else guarantees that.
         --
@@ -2807,6 +3095,49 @@ timer:addTask({
             return true
         end
         return false
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+------------------------------------------
+-- # PRAYER TEARDOWN AT WAR'S RETREAT
+------------------------------------------
+
+-- Drop any overhead we are still holding once we are back at War's Retreat.
+--
+-- Nothing at War's Retreat wants an overhead up, and one left on quietly drains
+-- the prayer we just walked to the altar to restore — so the trip refills a pool
+-- that is emptying behind it.
+--
+-- A DEDICATED TASK RATHER THAN A LINE IN THE RESET, because the resets do not
+-- all pass through the same place and two of them clear the fight flags BEFORE
+-- we land:
+--
+--   * A normal kill turns prayers off in handleFight's bossDead branch, but only
+--     while still in the arena.
+--   * The duo partner-gone bail calls RakshaFight:reset() in the ARENA, so by
+--     the time we arrive the "Resetting fight state at War's Retreat" task sees
+--     engaged and bossDead already false and never runs.
+--   * Death recovery resets on arrival for the same reason.
+--
+-- Keying off "am I at War's Retreat with a prayer on" instead covers every route
+-- home, including the ones that have not been written yet.
+timer:addTask({
+    name = "Deactivating prayers at War's Retreat",
+    priority = 90,
+    cooldown = 2,
+    useTicks = true,
+    parallel = true,
+    condition = function() return warsRetreat:atLocation() end,
+    action = function()
+        prayerFlicker:deactivatePrayer()
+
+        -- TRUE regardless of what that returned. Timer:_execute only starts a
+        -- task's cooldown on success, and deactivatePrayer reports false
+        -- whenever there was nothing to turn off — which is almost every pass we
+        -- spend here. Handing that straight back would re-run this every loop
+        -- iteration, and each run reads the prayer buffs one by one.
+        return true
     end,
     executionData = {lastRun = 0, count = 0}
 })
