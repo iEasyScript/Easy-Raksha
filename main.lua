@@ -303,6 +303,9 @@ ClearRender()
 local Common = {
     scriptStartTime = os.time(),
     killCount = 0,
+    -- Kill record staged by logKill, committed by confirmKill once a loot pile
+    -- proves the kill was real.
+    pendingKill = nil,
     deathCount = 0,
     killData = {},
     fightStartTick = nil,
@@ -368,6 +371,33 @@ local LOOT_HISTORY_LIMIT = 50
 --- Using the window's own total also removes the need to price commons by hand:
 --- the number already reflects live prices, stack sizes and every item in the
 --- pile, including anything missing from the LOOT table.
+--- Confirms a kill against the pile it dropped, and commits its timing record.
+---
+--- THE COUNTER LIVES HERE, not in logKill, because the kill DETECTOR is
+--- inferential: a run of ticks where Raksha reads as unfound is accepted as a
+--- kill. That is the right call for deciding to teleport out — being stranded in
+--- a finished instance is worse than leaving early — but it is the wrong basis
+--- for a count, because a bad scan mid-fight registers a kill that never
+--- happened. A loot pile is physical evidence. No boss, no pile.
+---
+--- The timing record moves with it, so fastest/slowest/average describe exactly
+--- the same set of kills the counter does rather than a slightly larger one.
+---
+--- Must run BEFORE the pile and any rare are recorded: both stamp themselves
+--- with Common.killCount, and they should carry the number of the kill they
+--- actually came from.
+local function confirmKill()
+    Common.killCount = Common.killCount + 1
+
+    if Common.pendingKill then
+        table.insert(Common.killData, Common.pendingKill)
+        Common.pendingKill = nil
+    end
+
+    Utils:log(string.format("----- KILL %d (confirmed by loot) -----",
+                            Common.killCount))
+end
+
 --- @param gained number Value read from the window BEFORE Loot All was pressed
 --- @return number gp Added this call
 local function recordLootValue(gained)
@@ -1946,6 +1976,10 @@ function RakshaFight:reset()
     self.variables.bossDead = false
     self.variables.looted = false
     self.variables.lootRecorded = false
+    -- Dropped rather than carried. A staged kill still sitting here means its
+    -- pile never materialised — loot timed out, or the detector fired on a bad
+    -- scan — and carrying it would hand its duration to the NEXT kill.
+    Common.pendingKill = nil
     self.variables.lootDeadline = 0
     self.variables.lootTimeoutLogged = false
     self.variables.bossSeen = false
@@ -2041,6 +2075,9 @@ function RakshaFight:pickUpLoot()
     if API.DoAction_LootAll_Button() then
         if not self.variables.lootRecorded then
             self.variables.lootRecorded = true
+            -- First, so the pile and any rare are stamped with this kill's
+            -- number rather than the previous one's.
+            confirmKill()
             recordUniqueDrops(uniques)
             recordLootValue(Utils:getLootWindowAmount())
         end
@@ -2056,7 +2093,6 @@ function RakshaFight:logKill()
     if self.variables.bossDead then return true end
     self.variables.bossDead = true
     self.variables.lootDeadline = API.Get_tick() + LOOT_TIMEOUT_TICKS
-    Common.killCount = Common.killCount + 1
 
     -- He's subdued: nothing left to pray against, so drop the overheads rather
     -- than draining prayer through the looting and the walk out.
@@ -2078,12 +2114,17 @@ function RakshaFight:logKill()
         durationMs = (API.Get_tick() - Common.fightStartTick) * 600
     end
 
-    table.insert(Common.killData, {
+    -- STAGED, not committed. Both the counter and the timing record are settled
+    -- against the loot pile instead — see confirmKill. This detector is
+    -- inferential (a run of ticks where Raksha reads as unfound counts as a
+    -- kill), which is right for deciding to teleport out and wrong for counting,
+    -- so nothing it produces is banked until a pile proves it.
+    Common.pendingKill = {
         runtime = API.ScriptRuntimeString(),
         fightDuration = Utils:formatKillDuration(durationMs)
-    })
+    }
 
-    Utils:log(string.format("----- KILL %d in %s -----", Common.killCount,
+    Utils:log(string.format("Boss down in %s — awaiting loot to confirm",
                             Utils:formatKillDuration(durationMs)))
 
     -- Fight review. The line that matters is any mechanic showing MISSED: that

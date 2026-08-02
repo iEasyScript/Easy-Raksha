@@ -911,7 +911,7 @@ local function drawLootTab(data)
         ui:tableRow("GP / hr", gp(loot.gpPerHour), SUCCESS_COLOR)
         ui:tableRow("GP / kill", gp(loot.gpPerKill))
         ui:tableRow("Best kill", gp(loot.bestKill))
-        ui:tableRow("Piles looted", tostring(#history))
+        ui:tableRow("Kills", tostring(whole(data.killCount)))
         ui:endColumns()
     end
 

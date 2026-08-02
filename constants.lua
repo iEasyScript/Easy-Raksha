@@ -431,6 +431,23 @@ Constants.PRAYER_FLICKER = {
 --- disables prayers. Tune down if the logs show us clearing it comfortably.
 Constants.TAIL_SWEEP_CLEARANCE = 7
 
+--- Clearance for PHASE 4 escapes, two tiles further out than everywhere else.
+---
+--- Phase 4 is the one phase we take the sweep from melee range: we hold the home
+--- tile four out and the escape is a short hop, so any shortfall in it leaves us
+--- inside. Observed in play — a Dive to the seven tile ring still got clipped.
+---
+--- Two tiles is also exactly the error the note above worries about. If the
+--- reported tile is a CORNER of his 5x5 rather than the centre, a tile seven
+--- from it can be barely five from where the sweep is really centred, and five
+--- is not enough. Nine absorbs that either way.
+---
+--- Still inside Necromancy's ~10 tile reach, so the rotation keeps hitting him
+--- from out here and the extra distance costs no damage. Left at 7 for phases
+--- 1-3, where we are usually already off him on an add and moving further only
+--- risks dropping the add out of range.
+Constants.TAIL_SWEEP_CLEARANCE_P4 = 9
+
 --- Tiles to retreat when a sweep answer's movement ability is on cooldown.
 ---
 --- Escape has a long cooldown next to how often Raksha sweeps at melee range, so
@@ -438,12 +455,17 @@ Constants.TAIL_SWEEP_CLEARANCE = 7
 --- not move AT ALL: runStep logged the ability as unavailable and the sequence
 --- marched on to the reattack, so we stood in the 7x7 and wore it.
 ---
---- Three tiles, measured from where we STAND rather than from Raksha. Phase 4
---- holds a tile PHASE4.homeOffsetX (4) east of him, so three more puts us seven
---- out — clear of the 7x7 with room to spare, comfortably inside the phase 4
---- arenaRadius of 10, and still within Necromancy's ~10 tile reach so the
---- rotation keeps hitting him on the way back in.
-Constants.TAIL_SWEEP_FALLBACK_WALK = 3
+--- Five tiles, measured from where we STAND rather than from Raksha. Phase 4
+--- holds a tile PHASE4.homeOffsetX (4) east of him, so five more puts us nine
+--- out — which is TAIL_SWEEP_CLEARANCE_P4 exactly, and that agreement is
+--- load-bearing rather than tidy. clearOfSweepRadius latches the "we are clear,
+--- stop moving" flag at the phase 4 clearance, so a retreat that stopped short
+--- of it would never satisfy the latch and we would shuffle in and out for the
+--- rest of the animation. Change one of these two and change the other.
+---
+--- Still inside the phase 4 arenaRadius of 10, and within Necromancy's ~10 tile
+--- reach so the rotation keeps hitting him on the way back in.
+Constants.TAIL_SWEEP_FALLBACK_WALK = 5
 
 --- How the fight loop should respond to each mechanic animation.
 ---
@@ -619,7 +641,7 @@ Constants.MECHANICS_BY_PHASE = {
             steps = {
                 {
                     ability = "Escape",
-                    walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+                    walkFromBossWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE_P4,
                     retreatWhenUnavailable = Constants.TAIL_SWEEP_FALLBACK_WALK,
                     wait = 4
                 },
@@ -628,7 +650,7 @@ Constants.MECHANICS_BY_PHASE = {
             priority = 60,
             exclusive = true,
             retriggerAfter = 5,
-            escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE,
+            escapeSweepWhenNotTargeting = Constants.TAIL_SWEEP_CLEARANCE_P4,
             sweepMover = "Escape"
         },
 

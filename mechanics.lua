@@ -1252,6 +1252,25 @@ local SWEEP_ANIMS = {
     [Constants.ANIM.TAIL_SWEEP_FREEDOM] = true
 }
 
+--- Tiles of clearance a sweep escape aims for, which differs by phase.
+---
+--- Phase 4 goes two further: we take the sweep from melee range there, so the
+--- hop is short and a shortfall leaves us inside it. See
+--- Constants.TAIL_SWEEP_CLEARANCE_P4.
+---
+--- Every phase 4 escape route has to agree on this number — the dive/surge
+--- target, the walking retreat and the "we are clear now, stop moving" latch
+--- alike. If the latch wanted more distance than the retreat delivers we would
+--- never satisfy it and would shuffle in and out for the whole animation.
+--- @return number
+function Mechanics:sweepClearance()
+    if self.state.phase >= 4 then
+        return Constants.TAIL_SWEEP_CLEARANCE_P4 or
+                   Constants.TAIL_SWEEP_CLEARANCE
+    end
+    return Constants.TAIL_SWEEP_CLEARANCE
+end
+
 --- Whether we are outside Raksha's tail sweep radius.
 --- @return boolean
 function Mechanics:clearOfSweepRadius()
@@ -1260,7 +1279,7 @@ function Mechanics:clearOfSweepRadius()
     if not center or not player then return false end
 
     local dx, dy = player.x - center.x, player.y - center.y
-    return math.sqrt(dx * dx + dy * dy) >= Constants.TAIL_SWEEP_CLEARANCE
+    return math.sqrt(dx * dx + dy * dy) >= self:sweepClearance()
 end
 
 --- Last line of defence for the tail sweep: a sweep is playing, we are still
@@ -1340,7 +1359,7 @@ function Mechanics:ensureClearOfSweep(boss)
 
     -- escapeSweep returns immediately when we are already outside the radius, so
     -- running this on every tick of every sweep costs nothing.
-    return self:escapeSweep(Constants.TAIL_SWEEP_CLEARANCE)
+    return self:escapeSweep(self:sweepClearance())
 end
 
 --- Backs straight away from Raksha by `tiles`, for when a sweep answer's
