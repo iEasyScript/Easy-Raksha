@@ -1,13 +1,6 @@
 --- @module 'raksha.main'
 --- @version 0.1.0
---- Raksha (normal mode) — fight loop.
----
---- Structure follows rasial/main.lua: a Timer holds prioritised tasks, one of
---- which drives the fight; War's Retreat handles everything between kills.
----
---- STATUS: end-to-end loop is in place and self-sustaining — War's Retreat ->
---- portal -> fight -> loot -> teleport back -> repeat. Settings are inline
---- constants; the GUI is a later step.
+--- Raksha — fight loop.
 ---@diagnostic disable: undefined-global
 
 local API             = require("api")
@@ -68,6 +61,72 @@ local LOADOUT = {
     }
 }
 
+--- Ripper Demon, kept out for the whole trip and specced whenever it can pay.
+---
+--- Set `enabled = false` to run without a familiar. Every task gates on it and
+--- the three items drop back out of LOADOUT with it, so nothing else needs
+--- touching — which matters, because leaving a pouch in LOADOUT that you do not
+--- actually own would fail the bank check forever and eventually terminate the
+--- script on the three-attempt guard.
+---
+--- Ids are off each item's own wiki page rather than copied from another script.
+local FAMILIAR = {
+    enabled = true,
+
+    -- Ripper demon pouch. 96 Summoning, 64 minute duration.
+    pouch = 49417,
+
+    -- Ripper Demon scroll (Death From Above). Its wiki page puts the special at
+    -- 20 special move points, or 16 with a spirit cape — the pool is 60, so a
+    -- full bar is three casts.
+    scroll = 49419,
+    scrollAmount = 20,
+
+    -- Special move points needed before we bother trying. Deliberately the
+    -- FULL 20 rather than the spirit cape's 16: overshooting wastes a potion
+    -- dose, undershooting wastes the cast.
+    specialCost = 20,
+
+    -- Spiritual prayer potion, any dose. 15 special move points a dose, on top
+    -- of the prayer and summoning points it also restores.
+    potionIds = {49017, 49019, 49021, 49023, 49025, 49027},
+
+    -- Drink when the pool can no longer pay for a cast.
+    drinkBelowPoints = 20,
+
+    -- Renew when the familiar has less than this long left. Familiars:
+    -- GetTimeRemaining reports seconds, so this is five minutes — comfortably
+    -- more than a kill, so it renews at War's Retreat rather than expiring
+    -- mid-fight.
+    renewBelowSeconds = 300
+}
+
+if FAMILIAR.enabled then
+    -- One pouch, and expect it to cost an extra bank trip the first time.
+    --
+    -- Summoning CONSUMES the pouch, so the moment we summon the count drops to
+    -- zero, the match check fails and War's Retreat banks again. That is not a
+    -- bug to design around — it is what leaves a spare pouch in the bag, which
+    -- is exactly what Familiars:CanRenew needs to top the timer up later. It
+    -- settles after one extra visit: the reload hands us a pouch, the familiar
+    -- is already out so nothing spends it, and the check passes from then on.
+    LOADOUT[#LOADOUT + 1] = {
+        id = FAMILIAR.pouch,
+        amount = 1,
+        name = "Ripper demon pouch"
+    }
+    LOADOUT[#LOADOUT + 1] = {
+        id = FAMILIAR.scroll,
+        amount = FAMILIAR.scrollAmount,
+        name = "Ripper Demon scroll (Death From Above)"
+    }
+    LOADOUT[#LOADOUT + 1] = {
+        ids = FAMILIAR.potionIds,
+        amount = 1,
+        name = "Spiritual prayer potion"
+    }
+end
+
 local SCRIPT_VERSION = "0.2.0"
 
 ------------------------------------------
@@ -111,13 +170,12 @@ local LOOT = {
         989, 990, -- Crystal key (noted)
         54019, -- Catalytic anima stone
         566, -- Soul rune
-
-        -- Tertiary
-        51102 -- Broken shackle (1/1,000)
     },
 
     -- The 1/50 unique table.
     UNIQUES = {
+        51102, -- Broken shackle (pet)
+
         51082, -- Fleeting boots
         51086, -- Shadow spike
         51094, -- Greater Ricochet ability codex
@@ -243,11 +301,6 @@ local BUFFS = {
 ------------------------------------------
 
 Interact:SetSleep(0, 0, 0)
--- API.Write_fake_mouse_do(false) was here. It is GONE from api.lua as of 1.077
--- — the API table has no metatable, so the call resolved to nil and terminated
--- the script on the very first line it ran. There is no replacement in the new
--- API (the only mouse functions left are GetTilesUnderCurrentMouse[F]), and
--- nothing here depended on the setting, so it is simply dropped.
 API.ClearLog()
 
 ------------------------------------------
@@ -2606,6 +2659,159 @@ RakshaFight.tasks = {
 for _, task in pairs(RakshaFight.tasks) do timer:addTask(task) end
 
 ------------------------------------------
+-- # FAMILIAR
+------------------------------------------
+
+--- Special move points currently in the pool, out of 60.
+--- @return number
+local function familiarPoints()
+    local ok, points = pcall(function() return Familiars:GetSpellPoints() end)
+    return (ok and tonumber(points)) or 0
+end
+
+--- @return boolean
+local function familiarOut()
+    local ok, has = pcall(function() return Familiars:HasFamiliar() end)
+    return ok and has and true or false
+end
+
+--- Seconds the current familiar has left, or 0 when we cannot read it.
+--- @return number
+local function familiarTimeLeft()
+    local ok, left = pcall(function() return Familiars:GetTimeRemaining() end)
+    return (ok and tonumber(left)) or 0
+end
+
+-- Summon the Ripper Demon at War's Retreat.
+--
+-- Only here, never in the arena: summoning is a pouch click that costs the
+-- summoning points we want spent on the familiar being OUT for the fight, and a
+-- trip that starts without one should notice before it walks through the portal.
+timer:addTask({
+    name = "Summoning familiar",
+    priority = 72,
+    cooldown = 4,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        if not FAMILIAR.enabled then return false end
+        if not warsRetreat:atLocation() then return false end
+        if Common.isDead then return false end
+        if familiarOut() then return false end
+        return Inventory:Contains(FAMILIAR.pouch)
+    end,
+    action = function()
+        Utils:log("Summoning Ripper Demon", "info")
+        return API.DoAction_Inventory1(FAMILIAR.pouch, 0, 1,
+                                       API.OFF_ACT_GeneralInterface_route)
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+-- Renew it before it lapses, following rasial's pattern of doing familiar upkeep
+-- at War's Retreat once the preset is in.
+--
+-- Renewing rather than re-summoning keeps the familiar's timer topped up without
+-- dismissing it, so the DPS never stops. Button 7 on the follower panel is
+-- "renew familiar" — see the DoAction_Button_FO table in api.lua.
+timer:addTask({
+    name = "Renewing familiar",
+    priority = 71,
+    cooldown = 4,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        if not FAMILIAR.enabled then return false end
+        if not warsRetreat:atLocation() then return false end
+        if Common.isDead then return false end
+        if not familiarOut() then return false end
+
+        -- CanRenew is the client's own "is there a pouch to do this with"
+        -- check, so we never click a button that cannot work.
+        local ok, canRenew = pcall(function() return Familiars:CanRenew() end)
+        if not ok or not canRenew then return false end
+
+        return familiarTimeLeft() < FAMILIAR.renewBelowSeconds
+    end,
+    action = function()
+        Utils:log(string.format("Renewing familiar (%ds left)",
+                                familiarTimeLeft()), "info")
+        return API.DoAction_Button_FO(7)
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+-- Top the special move pool back up with a Spiritual prayer potion.
+--
+-- Runs in the fight as well as at War's Retreat, because 60 points is only three
+-- casts and the pool is what turns the familiar from a passive damage source
+-- into a specced one. A dose gives 15 points back plus prayer and summoning,
+-- none of which is ever wasted here.
+--
+-- dontDrink pauses the player manager around it for the same reason the
+-- adrenaline potion does: two inventory clicks in one tick means one is thrown
+-- away, and the one we lose is whichever went second.
+timer:addTask({
+    name = "Drinking spiritual prayer potion",
+    priority = 69,
+    cooldown = 5,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        if not FAMILIAR.enabled then return false end
+        if Common.isDead then return false end
+        if not familiarOut() then return false end
+        if familiarPoints() >= FAMILIAR.drinkBelowPoints then return false end
+        return Inventory:ContainsAny(FAMILIAR.potionIds)
+    end,
+    action = function()
+        playerManager:dontDrink(ADREN_POTION_DONT_DRINK)
+        Utils:log(string.format(
+                      "Special move points at %d — drinking spiritual prayer potion",
+                      familiarPoints()), "info")
+        return API.DoAction_Inventory2(FAMILIAR.potionIds, 0, 1,
+                                       API.OFF_ACT_GeneralInterface_route)
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+-- Fire Death From Above whenever the pool can pay for it.
+--
+-- A familiar special does NOT spend the player's global cooldown, which is why
+-- this is its own parallel task rather than another branch in the rotation's
+-- consumed chain — it costs the rotation nothing and should never lose a tick to
+-- it. Same reasoning as the phase 4 special action button.
+timer:addTask({
+    name = "Familiar special attack",
+    priority = 70,
+    -- Roughly the special's own cadence. Faster just burns scroll clicks on a
+    -- pool that cannot pay yet.
+    cooldown = 8,
+    useTicks = true,
+    parallel = true,
+    condition = function()
+        if not FAMILIAR.enabled then return false end
+        if not RakshaFight:atLocation() then return false end
+        if not RakshaFight.variables.engaged then return false end
+        if RakshaFight.variables.bossDead then return false end
+        if not familiarOut() then return false end
+        if familiarPoints() < FAMILIAR.specialCost then return false end
+        return Inventory:Contains(FAMILIAR.scroll)
+    end,
+    action = function()
+        local ok, fired = pcall(function()
+            return Familiars:CastSpecialAttack()
+        end)
+        if ok and fired then
+            Utils:log("Familiar special: Death From Above", "debug")
+            return true
+        end
+        return false
+    end,
+    executionData = {lastRun = 0, count = 0}
+})
+
+------------------------------------------
 -- # INVENTORY READ RECOVERY
 ------------------------------------------
 
@@ -2624,17 +2830,62 @@ local INVENTORY_BROKEN_SAMPLES = 3
 --- Consecutive bad inventory samples seen so far.
 local invBrokenStreak = 0
 
+--- Slots a healthy inventory read reports. Always 28.
+local INVENTORY_SLOTS = 28
+
 --- Whether the client's inventory array is currently unusable.
 ---
---- Inventory:IsArrayNull() is exactly this question — its own documentation says
---- "null or unexpected size", i.e. anything that is not the 28 slots an
---- inventory has. Wrapped in pcall because a call that throws is itself evidence
---- the container is not readable.
---- @return boolean
+--- TWO signals, because one was not enough. Inventory:IsArrayNull() reads like
+--- the whole answer — its own documentation says "null or unexpected size" — but
+--- a watchdog built on it alone never fired once while the client was logging
+--- "Unexpected inventory size" on every frame. Whatever that message is raised
+--- from, IsArrayNull does not agree with it.
+---
+--- So the slot count is asked directly as well. A healthy read has 28 entries;
+--- anything else IS the fault, by definition, and needs no interpretation.
+---
+--- ReadInvArrays33 is a native call, which is why this runs on the watchdog's
+--- tick cadence and never per frame.
+--- AMBIGUITY MEANS HEALTHY. Anything this cannot measure is reported as fine.
+---
+--- That rule is written in blood. The first version treated "could not measure
+--- it" as a fault, via `type(slots) ~= "table"` — and ReadInvArrays33 does not
+--- return a Lua table. Every caller in this repo iterates it with ipairs and
+--- none of them ever calls type() or #, which is the signature of a userdata
+--- binding: ipairs-able through metamethods, but `type()` says "userdata".
+---
+--- So that check was true on EVERY call, healthy or not. The watchdog fired
+--- continuously at War's Retreat, forced a preset reload every fifteen ticks,
+--- pinned the step machine on LOAD PRESET and stopped the script ever reaching
+--- the portal. A watchdog that acts on "I don't know" is worse than no watchdog.
+---
+--- The count is therefore taken by ITERATING, which works on a table and on an
+--- ipairs-able userdata alike, and a failure to count reports healthy.
+--- @return boolean broken
+--- @return string reason Human-readable, for the log
 local function inventoryReadBroken()
-    local ok, isNull = pcall(function() return Inventory:IsArrayNull() end)
-    if not ok then return true end
-    return isNull and true or false
+    -- The client's own verdict. Trusted when it says yes, ignored otherwise.
+    local okNull, isNull = pcall(function() return Inventory:IsArrayNull() end)
+    if okNull and isNull then return true, "IsArrayNull reported true" end
+
+    local okCount, count = pcall(function()
+        local slots = API.ReadInvArrays33()
+        if slots == nil then return nil end
+
+        local n = 0
+        for _ in ipairs(slots) do n = n + 1 end
+        return n
+    end)
+
+    -- Unmeasurable. Not evidence of anything, so say nothing.
+    if not okCount or type(count) ~= "number" then return false, "" end
+
+    if count ~= INVENTORY_SLOTS then
+        return true, string.format("%d slots, expected %d", count,
+                                   INVENTORY_SLOTS)
+    end
+
+    return false, ""
 end
 
 -- Recovers from a broken inventory read by reloading the preset.
@@ -2674,9 +2925,13 @@ timer:addTask({
         return true
     end,
     action = function()
-        if not inventoryReadBroken() then
+        local broken, reason = inventoryReadBroken()
+
+        if not broken then
             if invBrokenStreak > 0 then
-                Utils:log("Inventory read recovered", "info")
+                Utils:log(string.format(
+                              "Inventory read recovered after %d bad sample(s)",
+                              invBrokenStreak), "warn")
                 invBrokenStreak = 0
             end
             -- TRUE even though nothing happened. Timer:_execute only starts a
@@ -2687,12 +2942,26 @@ timer:addTask({
         end
 
         invBrokenStreak = invBrokenStreak + 1
+
+        -- Logged on EVERY bad sample, not just once we act. Staying quiet until
+        -- the third was indistinguishable from the watchdog not running at all,
+        -- and that is exactly how the first version's detection was able to
+        -- never fire without anyone noticing.
+        Utils:log(string.format("Inventory read bad (%s) — sample %d/%d", reason,
+                                invBrokenStreak, INVENTORY_BROKEN_SAMPLES),
+                  "warn")
+
         if invBrokenStreak < INVENTORY_BROKEN_SAMPLES then return true end
 
+        -- Acted on. Clear the streak so the recovery paces itself: it takes
+        -- another full run of bad samples to come back round, which gives the
+        -- teleport time to land and the preset time to load before we judge it
+        -- again.
+        invBrokenStreak = 0
+
         if not warsRetreat:atLocation() then
-            Utils:log(string.format(
-                          "Inventory read broken on %d consecutive checks — teleporting to War's Retreat",
-                          invBrokenStreak), "warn")
+            Utils:log("Inventory read broken — teleporting to War's Retreat",
+                      "warn")
             Utils:useAbility("War's Retreat Teleport")
             return true
         end
@@ -2700,7 +2969,9 @@ timer:addTask({
         -- At War's Retreat. Force the bank stop rather than trusting the
         -- ordinary inventory-match route to get us there: that route is decided
         -- by the very read we have just declared unusable. requirePresetLoad is
-        -- idempotent, so calling it on every sample costs nothing.
+        -- idempotent and logs its own transition.
+        Utils:log("Inventory read broken at War's Retreat — forcing a preset reload",
+                  "warn")
         warsRetreat:requirePresetLoad()
         return true
     end,
