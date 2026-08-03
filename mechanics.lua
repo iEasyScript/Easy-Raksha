@@ -2248,9 +2248,24 @@ function Mechanics:handleAnimaPools()
     -- Latch: from here we keep clearing every tick until none are left.
     self.state.poolsActive = true
 
-    -- Stay clear of bombs + floor shadows while we clear the pools (no GCD).
-    local bombsDef = Constants.MECHANICS[Constants.ANIM.BOMBS]
-    if bombsDef then self:dodgeBombs(bombsDef, nil) end
+    -- NO BOMB DODGING WHILE WE CLEAR. This used to call dodgeBombs every pass,
+    -- and that is what made a sweep take so long: the clear is a race against
+    -- the siphon — every pool he pulls in heals him 5,000 and stacks his damage
+    -- buff — so time spent walking away from falling rocks is time the pools are
+    -- still standing.
+    --
+    -- Worse, dodgeBombs treats the ANIMA POOLS THEMSELVES as hazards to walk
+    -- away from. Running it here meant the pool killer walked us toward a pool
+    -- while the dodge walked us off it, on the same tick.
+    --
+    -- WHAT THIS DOES NOT GIVE UP. The lethal ground — floor shadows and the 2789
+    -- highlight — is instant death and is not handled here at all: handleInstakill
+    -- runs at the top of update(), above everything including this, so it still
+    -- moves us off anything that kills outright. The dive below also still checks
+    -- getAllHazardTiles() before committing, so we cannot land in one.
+    --
+    -- What we accept is bomb DAMAGE during a clear, which is survivable, in
+    -- exchange for the pools dying before he siphons them.
 
     -- The pool we're already killing, and the nearest one as a fallback.
     local nearest, nd = nil, math.huge

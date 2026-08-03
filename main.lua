@@ -1256,7 +1256,6 @@ local FIGHT_ROTATION = {
     {label = "Bloat", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
@@ -1302,18 +1301,18 @@ local PHASE2_ROTATION = {
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     volleyOfSouls(3),
     {label = "Living Death", wait = 3, useTicks = true},
-    adrenalinePotion(4),
     {label = "Touch of Death", wait = 3, useTicks = true},
-    -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
-    {label = "Death Skulls", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
-            {
+    {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
         useTicks = true,
         setupBoundary = true
     },
+    adrenalinePotion(4),
+    -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
+    {label = "Death Skulls", wait = 4, useTicks = true},
+    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
     fingerOfDeath(4),
     fingerOfDeath(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
@@ -1355,7 +1354,7 @@ local PHASE3_ROTATION = {
     fingerOfDeath(3),
     fingerOfDeath(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-            {
+    {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
@@ -1420,7 +1419,7 @@ local PHASE4_ROTATION = {
     {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
     {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
     adrenalinePotion(4),
-            {
+    {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
@@ -2041,7 +2040,7 @@ function RakshaLobby:joinLeaderInstance()
     -- Kerapac's HandleJoinPlayer does not check anything either — it clicks,
     -- sleeps a tick and types. That version works in production, so this one
     -- follows it rather than being clever.
-    API.Sleep_tick(2)
+    API.Sleep_tick(4) -- let the prompt appear before typing
 
     -- Uppercased, and sent as a "0x41" STRING rather than the number 65.
     -- Numerically identical, and the number is what KeyboardPress2 is annotated
@@ -2065,7 +2064,7 @@ function RakshaLobby:joinLeaderInstance()
 
         local hex = string.format("%02X", string.byte(upper, i))
         ---@diagnostic disable-next-line: param-type-mismatch
-        API.KeyboardPress2("0x" .. hex, 60, 110) -- types username char by char
+        API.KeyboardPress2("0x" .. hex, 100, 180) -- types username char by char
     end
 
     if API.InInstancedArea() then return true end
