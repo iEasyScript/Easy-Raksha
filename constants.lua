@@ -178,6 +178,17 @@ function Constants.setPartySize(size)
     -- Reassigned rather than mutated: this one is a number, and every reader
     -- looks it up through Constants at call time.
     Constants.LUCK_RING_HP = Constants.LUCK_RING_HP_SOLO * size
+
+    -- The phase 3 anima-pool window, for the same reason and by the same rule:
+    -- these are HP thresholds INSIDE a phase whose own boundaries just doubled,
+    -- so they have to double with it or they fall outside the phase entirely and
+    -- silently stop firing. See the comment on them in ADDS.ANIMA_POOL.
+    --
+    -- Mutated in place: mechanics.lua reads them off Constants.ADDS.ANIMA_POOL,
+    -- which it holds a reference to.
+    local pool = Constants.ADDS.ANIMA_POOL
+    pool.startBelowHpInPhase3 = pool.startBelowHpInPhase3Solo * size
+    pool.skipBelowHpInPhase3 = pool.skipBelowHpInPhase3Solo * size
 end
 
 --- Phase 4 is a different, smaller arena and Raksha heals back to 400k on entry
@@ -335,9 +346,31 @@ Constants.ADDS = {
         -- killThresholdByPhase below. Once started we always clear to ZERO.
         killThreshold = 10,
 
-        -- Phase 3 endgame. Below this HP we're close enough to the phase 4
+        -- THE PHASE 3 POOL WINDOW: start below `startBelowHpInPhase3`, stop
+        -- below `skipBelowHpInPhase3`. Outside it we are on Raksha.
+        --
+        -- Phase 3 OPENS with damage on the boss, not a detour. He enters it at
+        -- full phase health with no pools worth the walk yet, and the rotation's
+        -- first six steps (the Finger pair, Death Skulls, Bloat, Volley) are the
+        -- burst the phase is built around — breaking off for pools before those
+        -- land trades the best damage in the phase for a handful of 5,000 heals.
+        -- So we hold until he is 10,000 down.
+        --
+        -- The bottom of the window is the mirror: close enough to the phase 4
         -- transition (200k) that pushing damage straight into Raksha beats
         -- spending the time on pools — he'll phase before they matter.
+        --
+        -- BOTH ARE SOLO NUMBERS and both are rescaled by setPartySize, exactly
+        -- like PHASE_HP. Left flat they do not merely drift, they stop working
+        -- altogether: a duo fights phase 3 from 800,000 down to 400,000, so a
+        -- flat 390,000 start gate is never reached and pools would NEVER be
+        -- cleared, while a flat 325,000 stop gate is never reached either and
+        -- the endgame skip would never fire. Read the live fields, never the
+        -- _SOLO ones.
+        startBelowHpInPhase3Solo = 375000,
+        startBelowHpInPhase3 = 375000,
+
+        skipBelowHpInPhase3Solo = 325000,
         skipBelowHpInPhase3 = 325000,
 
         -- POOLS ARE CLEARED IN PHASE 3 ONLY.
@@ -634,10 +667,25 @@ Constants.MECHANICS = {
         behaviour = "dodgeBombs",
         hazard = "BOMB_HAZARD",
         escapeDistance = 5, -- tiles clear of a bomb's tile (covers the 2x2 + margin)
-        moveEveryTicks = 1, -- re-evaluate every tick; bombs drop quickly
+
+        -- Re-issue the walk every 3 ticks, not every 1. A walk order takes
+        -- several ticks to actually arrive, and re-issuing one each tick
+        -- CANCELS the path in progress — so with bombs landing continuously we
+        -- picked a new "nearest safe tile" every tick and never reached any of
+        -- them. That is the shuffling on the spot, and it is a separate fault
+        -- from the pool tug-of-war: this one happens whether or not pools are
+        -- up. 3 is comfortably inside the bombs' own timing and long enough to
+        -- cover ground.
+        moveEveryTicks = 3,
         priority = 70,
         duration = 20,
-        retriggerAfter = 1
+
+        -- Also 3, and not only to limit re-registration noise: Mechanics:begin()
+        -- resets poolsActive to false, so at 1 this definition was knocking the
+        -- pool-clear latch down every couple of ticks for the whole bomb phase.
+        -- Mechanics:poolClearInProgress() is what actually makes that harmless
+        -- now, but there is no reason to re-arm this fast either.
+        retriggerAfter = 3
     },
 
     [Constants.ANIM.SHADOW_BOMBARDMENT] = {

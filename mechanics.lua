@@ -436,11 +436,19 @@ function Mechanics:getShadowTiles()
     return out
 end
 
---- Every area we must never move into, as hazard boxes: floor shadows and
---- insta-kill highlights (both lethal) plus the ground bombs. Used to validate a
---- Dive destination — a blind dive into a shadow is instant death.
+--- The LETHAL ground only: floor shadows and the 2789 insta-kill highlights.
+--- Standing in either is an instant death, so these are the hazards no movement
+--- may ever ignore, however urgent it is.
+---
+--- Split out from getAllHazardTiles because "never land here or you die" and
+--- "prefer not to stand here" were being treated as the same thing, and that
+--- silently disabled the pool clear's Dive. The full list includes a box around
+--- every anima pool, so validating a dive ONTO a pool against it asked whether
+--- the pool's own tile was clear of the pool — distance 0 against a clearance of
+--- 2, false every time. Every approach fell back to walking, and with
+--- diveDistance at 8 that is most of a sweep spent crossing the arena on foot.
 --- @return table[]
-function Mechanics:getAllHazardTiles()
+function Mechanics:getLethalHazardTiles()
     local hazards = self:getShadowTiles()
 
     local ik = Constants.INSTAKILL
@@ -452,6 +460,16 @@ function Mechanics:getAllHazardTiles()
                                                           ik.triggerRange))
         end
     end
+
+    return hazards
+end
+
+--- Every area we must never move into, as hazard boxes: the lethal ground above,
+--- plus the anima pools, the ground bombs and (in phase 4) Raksha's own blocked
+--- footprint. Used to validate a movement destination in the general case.
+--- @return table[]
+function Mechanics:getAllHazardTiles()
+    local hazards = self:getLethalHazardTiles()
 
     -- Phase 4: Raksha is a blocked 5x5 that can't be walked through, so his
     -- footprint is a pathing hazard. Clearance is deliberately TINY — we want to
@@ -682,6 +700,24 @@ end
 function Mechanics:rotationOnHold()
     return self.state.poolsActive or self.state.manifestationActive or
                self.state.addsActive
+end
+
+--- True from the moment the phase 3 rotation casts "Threads of Fate + target
+--- pools" until the last pool is dead. While this holds, the pool clear owns our
+--- movement outright and the bomb dodge is suppressed (see runActive).
+---
+--- Deliberately checks the REQUEST as well as the latch, and that second half is
+--- load-bearing. Mechanics:begin() resets poolsActive to false, and the BOMBS
+--- definition re-arms every couple of ticks for the whole bomb phase (duration
+--- 20, retriggerAfter 3) — so during exactly the window we care about, the latch
+--- is being knocked down and rebuilt constantly. runActive runs BEFORE
+--- handleAnimaPools in update(), so on any iteration where begin() had just
+--- cleared the latch, a check on poolsActive alone would read false and let the
+--- dodge run. poolClearRequested survives all of that: it is set once by the
+--- rotation and cleared only when the pools are actually gone.
+--- @return boolean
+function Mechanics:poolClearInProgress()
+    return self.state.poolsActive or self.state.poolClearRequested
 end
 
 --- True when Raksha is our current target. Escape teleports us away from what
@@ -2031,11 +2067,32 @@ function Mechanics:runActive(boss)
         end
 
         if definition.behaviour == "dodgeBombs" then
-            -- Just dodge here. Pool-killing is handled globally by
-            -- handleAnimaPools (presence-based), which runs earlier in update()
-            -- and dodges too, so this only matters when bombs are out with no
-            -- pools present.
-            self:dodgeBombs(definition, boss)
+            -- NOT WHILE WE ARE CLEARING POOLS.
+            --
+            -- This is the other half of the "no bomb dodging during a clear"
+            -- rule in handleAnimaPools, and for a long time only that half
+            -- existed: the call was removed from inside the pool handler, but
+            -- this one kept running and the two walked us in opposite
+            -- directions on the same iteration. dodgeBombs returns false, so it
+            -- never consumed the tick — handleAnimaPools ran straight after it
+            -- (step 5-6 of update(), BELOW this) and clicked the pool we had
+            -- just been walked away from. Every tick, for the whole sweep.
+            --
+            -- It is worse than a wash, because dodgeBombs counts the anima
+            -- pools THEMSELVES as hazards to stand clear of. The tile we have
+            -- to be on to attack a pool is by definition inside that pool's
+            -- hazard box, so the dodge was specifically pushing us off the
+            -- destination the clear was walking to.
+            --
+            -- The clear is a race against the siphon — 5,000 healed per pool
+            -- plus a stacking damage buff — so bomb DAMAGE is the cheaper side
+            -- of this trade. What we do NOT give up is the lethal ground: the
+            -- floor shadows and the 2789 highlight are instant death and
+            -- handleInstakill answers them at the top of update(), above all of
+            -- this, so they still move us.
+            if not self:poolClearInProgress() then
+                self:dodgeBombs(definition, boss)
+            end
             return false
 
         elseif definition.behaviour == "burnDome" then
@@ -2228,6 +2285,26 @@ function Mechanics:handleAnimaPools()
     -- the boss. Only crossing the threshold — or the phase 3 rotation reaching
     -- its "target pools" step, or Raksha announcing the siphon — starts a clear.
     if not self.state.poolsActive then
+        -- TOP OF THE WINDOW. Phase 3 opens on Raksha, not on a detour: he enters
+        -- at full phase health and we stay on him until he is 10,000 down.
+        --
+        -- Checked before the siphon and the rotation request, and overriding
+        -- both, because it is the same kind of rule as the math.huge phases —
+        -- "not here, whatever the cue says". The window's other end
+        -- (skipBelowHpInPhase3) is enforced further up.
+        --
+        -- poolClearRequested is deliberately LEFT ARMED. The rotation reaches
+        -- its "Threads of Fate + target pools" step at a fixed point in the
+        -- line, which can land while he is still above the gate; dropping the
+        -- request there would lose the clear entirely, so instead it waits and
+        -- fires the moment his health crosses. Only a genuinely finished or
+        -- cancelled clear clears that flag.
+        local startBelow = pool.startBelowHpInPhase3
+        if startBelow and self.state.phase == 3 and self.state.bossLife > 0 and
+            self.state.bossLife > startBelow then
+            return false
+        end
+
         -- The siphon message overrides the THRESHOLD: every pool he pulls in
         -- heals him 5,000 and stacks his damage buff, so once it's announced
         -- they all have to go regardless of how few are up. It does not override
@@ -2246,23 +2323,41 @@ function Mechanics:handleAnimaPools()
     end
 
     -- Latch: from here we keep clearing every tick until none are left.
+    --
+    -- BOTH flags, whichever trigger got us here. poolsActive alone is not a
+    -- durable latch — Mechanics:begin() resets it, and the bomb phase registers
+    -- mechanics continuously, so a clear that started on the count threshold or
+    -- the siphon cue was being dropped part-way through. Once the count had
+    -- fallen below the threshold (3) the re-entry test then refused to restart
+    -- it, and the last two or three pools were simply left standing for Raksha
+    -- to siphon — the exact failure the "clear to ZERO" rule exists to prevent.
+    --
+    -- poolClearRequested survives begin(), and every exit path below already
+    -- clears it (pools gone, phase says never, endgame HP skip, setting
+    -- disabled), so nothing can leave it armed.
     self.state.poolsActive = true
+    self.state.poolClearRequested = true
 
-    -- NO BOMB DODGING WHILE WE CLEAR. This used to call dodgeBombs every pass,
-    -- and that is what made a sweep take so long: the clear is a race against
-    -- the siphon — every pool he pulls in heals him 5,000 and stacks his damage
-    -- buff — so time spent walking away from falling rocks is time the pools are
-    -- still standing.
+    -- NO BOMB DODGING WHILE WE CLEAR. The clear is a race against the siphon —
+    -- every pool he pulls in heals him 5,000 and stacks his damage buff — so
+    -- time spent walking away from falling rocks is time the pools are still
+    -- standing.
     --
     -- Worse, dodgeBombs treats the ANIMA POOLS THEMSELVES as hazards to walk
-    -- away from. Running it here meant the pool killer walked us toward a pool
-    -- while the dodge walked us off it, on the same tick.
+    -- away from, so it pushes us off the exact tile we need to stand on to
+    -- attack one: the pool killer walks us toward a pool while the dodge walks
+    -- us off it, on the same tick.
+    --
+    -- BOTH halves of that are now enforced. It isn't called from here, and
+    -- runActive skips its own call while poolClearInProgress() holds — which is
+    -- the one that was actually doing the damage, because dodgeBombs returns
+    -- false and so never stopped this handler running immediately afterwards.
     --
     -- WHAT THIS DOES NOT GIVE UP. The lethal ground — floor shadows and the 2789
     -- highlight — is instant death and is not handled here at all: handleInstakill
     -- runs at the top of update(), above everything including this, so it still
-    -- moves us off anything that kills outright. The dive below also still checks
-    -- getAllHazardTiles() before committing, so we cannot land in one.
+    -- moves us off anything that kills outright. The dive below checks
+    -- getLethalHazardTiles() before committing, so we cannot land in one either.
     --
     -- What we accept is bomb DAMAGE during a clear, which is survivable, in
     -- exchange for the pools dying before he siphons them.
@@ -2314,15 +2409,23 @@ function Mechanics:handleAnimaPools()
     local approach = target or nearest
     local ad = (approach and approach.Distance) or math.huge
 
-    -- Close a long gap with Dive, but ONLY onto a tile that clears every hazard
-    -- — a blind dive into a floor shadow is instant death. Skipped entirely when
-    -- Dive/Bladed Dive is on cooldown.
+    -- Close a long gap with Dive, but ONLY onto a tile that clears the LETHAL
+    -- ground — a blind dive into a floor shadow is instant death. Skipped
+    -- entirely when Dive/Bladed Dive is on cooldown.
+    --
+    -- Lethal-only, deliberately, and this is what makes the dive fire at all.
+    -- Checked against getAllHazardTiles it could never succeed: that list puts a
+    -- box around every anima pool with a clearance of 2, and the destination
+    -- here IS a pool's tile — zero tiles from its own box, so "clear" was false
+    -- on every single approach and we walked the whole way instead. Bombs are
+    -- excluded for the same reason they aren't dodged during a clear: landing in
+    -- one costs damage, not the kill.
     if approach and ad > (pool.diveDistance or 8) and self:canDive() then
         local tile = approach.Tile_XYZ
         local player = Player:getCoords()
         if tile and player then
             local tx, ty = math.floor(tile.x), math.floor(tile.y)
-            if tileIsClear(tx, ty, self:getAllHazardTiles()) then
+            if tileIsClear(tx, ty, self:getLethalHazardTiles()) then
                 ---@diagnostic disable-next-line: undefined-global
                 local dest = WPOINT.new(tx, ty, math.floor(player.z or 0))
                 if self:diveToTile(dest) then
@@ -3077,6 +3180,27 @@ function Mechanics:tracking()
                     return string.format("ignored (phase %d)", self.state.phase)
                 end
                 if self.state.poolsActive then return "KILLING (to zero)" end
+
+                -- Which END of the phase 3 window we're outside, when we are.
+                -- "idle" alone was ambiguous the moment the window existed:
+                -- above the top gate and below the bottom one look identical
+                -- from the outside, and they mean opposite things.
+                local life = self.state.bossLife or 0
+                if self.state.phase == 3 and life > 0 then
+                    local startBelow = pool.startBelowHpInPhase3
+                    if startBelow and life > startBelow then
+                        return string.format("holding on boss (>%d hp)%s",
+                                             startBelow,
+                                             self.state.poolClearRequested and
+                                                 ", ROTATION ARMED" or "")
+                    end
+                    local skipBelow = pool.skipBelowHpInPhase3
+                    if skipBelow and life < skipBelow then
+                        return string.format("done (<%d hp, pushing to P4)",
+                                             skipBelow)
+                    end
+                end
+
                 return string.format("idle (<%d)", threshold)
             end)()
         },

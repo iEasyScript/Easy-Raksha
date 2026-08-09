@@ -1206,19 +1206,13 @@ local FIGHT_ROTATION = {
     -- full 3. Death Skulls (4) needs longer than the GCD.
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
-    {label = "Surge", wait = 3, useTicks = true},
-    {label = "Surge", wait = 1, useTicks = true},
-    {label = "Invoke Lord of Bones", wait = 2, useTicks = true},
     {label = "Life Transfer", wait = 2, useTicks = true},
+    {label = "Invoke Lord of Bones", wait = 2, useTicks = true},
+    {label = "Surge", wait = 3, useTicks = true},
+    {label = "Surge", wait = 2, useTicks = true},
+
     {label = "Command Vengeful Ghost", wait = 2, useTicks = true},
     {
-        -- Walk to the safespot, once, and record it as HOME for the fight.
-        --
-        -- The arena is instanced so fixed tiles shift between runs; we anchor to
-        -- the sleeping Raksha (27351) instead. Registering this as home makes it
-        -- the centre for every movement decision — dodges move off it and we
-        -- walk back once the danger clears, so positioning is repeatable rather
-        -- than drifting with the boss.
         label = "Walk to safespot",
         type = "Custom",
         action = function()
@@ -1236,14 +1230,26 @@ local FIGHT_ROTATION = {
             ---@diagnostic disable-next-line: undefined-global
             --return API.DoAction_WalkerW(WPOINT.new(hx, hy, hz))
         end,
-        wait = 0,
+        wait = 2,
         useTicks = true
     },
+
+    -- --- PVME PHASE 1 -------------------------------------------------------
+    -- Surge + Invoke death -> Command skeleton -> Split soul + Vuln bomb under
+    -- Raksha -> tc + Bloat -> Death skulls -> Volley of souls -> Soul sap ->
+    -- Divert -> Touch of death -> Soul sap -> Command skeleton
+    --
+    -- Ruination is NOT cast anywhere in here: it's in BUFFS, so the player
+    -- manager turns it on and, crucially, back off after the kill. Casting it
+    -- from both places races the activation delay and toggles it off again.
+    {label = "Invoke Death", wait = 3, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
-    {label = "Split Soul", wait = 2, useTicks = true},
-    {label = "Invoke Death", wait = 2, useTicks = true},
+
+    -- "Split soul + Vuln bomb under Raksha" — the bomb is thrown at whatever
+    -- we're targeting, so acquiring him first is what puts it under him.
     targetRaksha(1),
-    {
+    {label = "Split Soul", wait = 2, useTicks = true},
+        {
         label = "Vulnerability bomb",
         type = "Inventory",
         wait = 1,
@@ -1254,18 +1260,13 @@ local FIGHT_ROTATION = {
     -- "tc + Bloat": re-acquire Raksha, then open the damage.
     targetRaksha(1),
     {label = "Bloat", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
+    volleyOfSouls(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Divert", wait = 4, useTicks = true},
     {label = "Touch of Death", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 5, useTicks = true},
     {label = "Command Skeleton Warrior", wait = 2, useTicks = true},
-    volleyOfSouls(3),
 
     -- Phase 1 runs out into this only if he survives the scripted opener; the
     -- phase 2 rotation replaces the whole thing on transition.
@@ -1295,21 +1296,9 @@ local PHASE2_ROTATION = {
     -- Living Death takes 5 ticks to land before the next ABILITY, but a potion
     -- is an inventory action and off the global cooldown, so it slots into that
     -- window rather than extending it: 1 + 4 keeps Touch of Death where it was.
-    volleyOfSouls(3),
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    volleyOfSouls(3),
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    volleyOfSouls(3),
     {label = "Living Death", wait = 3, useTicks = true},
-    {label = "Touch of Death", wait = 3, useTicks = true},
-    {
-        label = "Vulnerability bomb",
-        type = "Inventory",
-        wait = 1,
-        useTicks = true,
-        setupBoundary = true
-    },
     adrenalinePotion(4),
+    {label = "Touch of Death", wait = 3, useTicks = true},
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
@@ -1318,18 +1307,10 @@ local PHASE2_ROTATION = {
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    conjureArmy(3),
-    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Touch of Death", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {label = "Soul Sap", wait = 3, useTicks = true},
-    volleyOfSouls(3),
-    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    volleyOfSouls(3),
 
     -- "improvise basics if not phased"
     improviseTail()
@@ -1354,13 +1335,6 @@ local PHASE3_ROTATION = {
     fingerOfDeath(3),
     fingerOfDeath(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
-    {
-        label = "Vulnerability bomb",
-        type = "Inventory",
-        wait = 1,
-        useTicks = true,
-        setupBoundary = true
-    },
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Bloat", wait = 3, useTicks = true},
     volleyOfSouls(3),
@@ -1381,6 +1355,96 @@ local PHASE3_ROTATION = {
     targetRaksha(1),
     volleyOfSouls(3),
 
+    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+}
+
+------------------------------------------
+-- # PHASE 4 ROTATION
+------------------------------------------
+--- PVME phase 4, in full:
+---   Anti -> Soul sap -> Touch of death -> Basic -> equip Excalibur -> equip
+---   Soulbound lantern + Conjure army -> Soul sap -> Command skeleton ->
+---   Command ghost -> Death skulls -> Ingenuity + Roar of awakening / Ode to
+---   deceit spec (0 tick) -> Divert -> Soul sap -> Split soul -> Bloat ->
+---   Omniguard spec -> Basic -> Soul sap -> Command skeleton -> Volley of
+---   souls -> Touch of death -> Finger of death -> Deathguard90 EOF spec ->
+---   improvise if not dead
+---
+--- Note what is NOT here: Living Death and the Adrenaline renewal. The guide
+--- spends both in phase 2 and funds phase 4 from the adrenaline carried in plus
+--- the specs, so neither appears in this line.
+---
+--- Every equip is conditional on carrying the item (see SWITCHES), so an
+--- account without a switch flows straight past it rather than stalling.
+local PHASE4_ROTATION = {
+    -- "Anti" — Anticipation, off the global cooldown, up before the phase's
+    -- first tail sweep.
+    {label = "Anticipation", wait = 1, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Touch of Death", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+
+    -- "equip Excalibur -> equip Soulbound lantern + Conjure army"
+    equipIfCarried(SWITCHES.excalibur, 1),
+    equipIfCarried(SWITCHES.lantern, 1),
+    conjureArmy(3),
+
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
+    {label = "Command Vengeful Ghost", wait = 1, useTicks = true},
+    adrenalinePotion(4),
+    {label = "Death Skulls", wait = 4, useTicks = true},
+    
+    -- "Ingenuity + Roar of awakening / Ode to deceit spec (0 tick)": Ingenuity
+    -- makes the spec free, both T100 shard-of-genesis weapons go on inside the
+    -- same tick (wait = 0), the spec fires, and we switch back off them.
+    {
+        label = "Ingenuity of the Humans",
+        condition = canSpec,
+        wait = 1,
+        useTicks = true,
+        replacementAction = function() return true end
+    },
+    equipIfCarried(SWITCHES.genesisMain, 0),
+    equipIfCarried(SWITCHES.genesisOff, 0),
+    weaponSpec(2),
+    restoreNecroWeapons(1),
+
+    {label = "Divert", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Split Soul", wait = 3, useTicks = true},
+    {label = "Bloat", wait = 3, useTicks = true},
+
+    -- "Omniguard spec", the same 0-tick shape: switch on, spec, switch back.
+    equipIfCarried(SWITCHES.omniGuard, 0),
+    weaponSpec(2),
+    restoreNecroWeapons(1),
+
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Command Skeleton Warrior", wait = 1, useTicks = true},
+    volleyOfSouls(3),
+    {label = "Touch of Death", wait = 3, useTicks = true},
+    fingerOfDeath(3),
+
+    -- "Deathguard90 EOF spec": the Essence of Finality amulet firing the stored
+    -- deathguard special.
+    equipIfCarried(SWITCHES.eof, 1),
+    {
+        label = "Essence of Finality",
+        type = "Custom",
+        condition = canSpec,
+        action = function()
+            local used = Utils:useAbility("Essence of Finality")
+            if used then markSpecUsed() end
+            return used
+        end,
+        wait = 3,
+        useTicks = true,
+        replacementAction = function() return true end
+    },
+
+    -- "improvise if not dead"
     {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
 }
 
@@ -1877,6 +1941,11 @@ local RakshaLobby = {
         -- settings panel currently open. Cleared on confirm, so each new
         -- instance sets its own size.
         instanceSizeSet = false,
+        -- True from the moment the Start button is confirmed until we either
+        -- get into the instance or a dialogue tells us the old one is still
+        -- alive. It is what separates the dialogue that is part of the create
+        -- flow from the one that means "you already have an instance".
+        startConfirmed = false,
         rejoinAttempts = 0, -- consecutive rejoin tries this trip
         lastInstanceAttempt = 0, -- os.clock() of the pending new-instance attempt
         instanceAttemptCount = 0, -- consecutive new-instance timeouts
@@ -1982,14 +2051,44 @@ function RakshaLobby:startNewInstance()
             self.variables.instanceAttemptCount = 0
             self.variables.rejoinAttempts = 0
             self.variables.instanceSizeSet = false
+            self.variables.startConfirmed = true
             self.variables.instanceCreatedAt = os.clock()
             return true
         end
         return false
     end
 
-    -- Second option on the dialogue (interface 1188, component 13).
     if API.Check_Dialog_Open() then
+        -- A DIALOGUE AFTER START MEANS THE OLD INSTANCE IS STILL ALIVE.
+        --
+        -- Pressing Start on a clean slate drops us straight in. If the game
+        -- stops to ask something instead, the thing it is asking about is the
+        -- instance we already own — so the answer is not to push through the
+        -- create flow, it is to go back to the gate and rejoin.
+        --
+        -- Only when we have actually clicked Start. A dialogue BEFORE that is
+        -- part of the ordinary create flow and still takes the second option
+        -- below; this branch is specifically about the one that appears after.
+        if self.variables.startConfirmed then
+            self.variables.startConfirmed = false
+
+            Utils:log("Dialogue after Start — instance is still live, rejoining",
+                      "warn")
+
+            -- The dialogue is modal, so a right-click aimed at the gate behind
+            -- it never reaches the object. Clear it first.
+            API.KeyboardPress2(0x1B, 60, 110) -- ESC
+            API.Sleep_tick(1)
+
+            -- Not a fresh creation after all, so drop the grace latch — leaving
+            -- it set would make handleInstance sit out the next several seconds
+            -- waiting on an instance we never made.
+            self.variables.instanceCreatedAt = 0
+
+            return self:rejoiningInstance()
+        end
+
+        -- Second option on the dialogue (interface 1188, component 13).
         Utils:log("Instance dialogue open — choosing the second option", "debug")
         ---@diagnostic disable-next-line:missing-parameter
         return API.DoAction_Interface(0xffffffff, 0xffffffff, 0, 1188, 13, -1,
@@ -2256,6 +2355,11 @@ function RakshaFight:reset()
     RakshaLobby.variables.rejoinAttempts = 0
     RakshaLobby.variables.lastInstanceAttempt = 0
     RakshaLobby.variables.instanceAttemptCount = 0
+    -- Cleared with them. A Start we clicked on the LAST trip must not make the
+    -- first ordinary dialogue of the next one look like "you already have an
+    -- instance" and send us to the rejoin.
+    RakshaLobby.variables.startConfirmed = false
+    RakshaLobby.variables.instanceSizeSet = false
 end
 
 --- Consecutive GAME TICKS with no party member visible in the arena.
