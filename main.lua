@@ -24,13 +24,13 @@ local GUI             = require("raksha.gui")
 --- Every dose of every potion the rotation will accept for its adrenaline beat.
 ---
 --- Both potions are carried in one list rather than picked between, because the
---- only two places that care — the bank check in LOADOUT and the click in
---- adrenalinePotion() — can each take the whole list and ask "any of these".
+--- places that care — the bank check in LOADOUT and adrenalinePotion()'s "have
+--- we got one" guard — can each take the whole list and ask "any of these".
 --- Nothing has to know WHICH one you brought.
 ---
---- ORDER IS PREFERENCE. DoAction_Inventory works down the list, so a bag holding
---- both drinks the renewal and keeps the replenishment. Swap the two blocks to
---- reverse that.
+--- ORDER IS PREFERENCE, and it still drives the drink. API.GetAB_ids matches the
+--- action bar against these ids in the order given, so a bag holding both drinks
+--- the renewal and keeps the replenishment. Swap the two blocks to reverse that.
 ---
 --- Note the two are not equivalent, only interchangeable: they restore different
 --- amounts of adrenaline, and PHASE2_ROTATION's beat after the drink is written
@@ -42,6 +42,25 @@ local ADRENALINE_POTION_IDS = {
     39220, 39222, 39224, 39226, 39228, 39230
 }
 
+--- LOADOUT is a CHECKLIST, not the thing that fills your bag.
+---
+--- Worth being explicit, because it is easy to read the other way round:
+--- core/wars_retreat loads supplies with Interact:Object(bank, "Load Last Preset
+--- from"), i.e. your IN-GAME preset. This table only drives two things —
+--- Utils:inventoryMatchCheck, which decides whether we need to re-bank, and the
+--- startup warnings about missing items.
+---
+--- Which makes a WRONG id here actively dangerous rather than merely useless:
+--- inventoryMatchCheck fails if any single entry is unsatisfied, that keeps
+--- sending us back to the bank, and loadLastPreset terminates the script on the
+--- third failed attempt. Only put ids in here that you have actually confirmed.
+---
+--- TODO: Super restore FLASKS. They belong in this list so that running out
+--- triggers a re-bank, but the flask ids are not in this codebase anywhere and
+--- are NOT the same as the plain potion's {3024, 3026, 3028, 3030}. Add them as
+--- an `ids` entry once confirmed. Nothing else needs changing for them to be
+--- drunk: core/player_manager's "prayer" category matches on the name pattern
+--- "Super restore", which "Super restore flask (6)" satisfies already.
 local LOADOUT = {
     {id = 48951, amount = 502, name = "Vulnerability bomb"},
     {id = 42267, amount = 10, name = "Blue blubber jellyfish"}, {
@@ -74,7 +93,12 @@ local FAMILIAR = {
     enabled = true,
 
     -- Ripper demon pouch. 96 Summoning, 64 minute duration.
+    --
+    -- Both the id and the name, because the two are used for different things:
+    -- the id gates the bag checks and the LOADOUT entry, the name presses the
+    -- action bar (see useBarItem). Keep them describing the same pouch.
     pouch = 49417,
+    pouchName = "Ripper demon pouch",
 
     -- Ripper Demon scroll (Death From Above). Its wiki page puts the special at
     -- 20 special move points, or 16 with a spirit cape — the pool is 60, so a
@@ -87,11 +111,30 @@ local FAMILIAR = {
     -- dose, undershooting wastes the cast.
     specialCost = 20,
 
+    -- OPTIONAL: Spiritual prayer potions, for topping the special move pool back
+    -- up mid-trip. OFF by default — the familiar works perfectly well without
+    -- them, you just get fewer Death From Above casts once the starting 60
+    -- points are spent.
+    --
+    -- Off matters more than it looks, because of what LOADOUT is: a checklist
+    -- fed to Utils:inventoryMatchCheck, which fails if ANY entry is unsatisfied.
+    -- An entry for a potion you don't carry means the inventory never matches,
+    -- we bank on a loop, and loadLastPreset terminates the script on its third
+    -- attempt. So the potion only joins the checklist when you have opted in.
+    --
+    -- Set true if you do carry them; nothing else needs changing.
+    usePotion = false,
+
     -- Spiritual prayer potion, any dose. 15 special move points a dose, on top
     -- of the prayer and summoning points it also restores.
+    --
+    -- Id list for the bag check and for the action bar press (GetAB_ids matches
+    -- by icon id, which covers every dose); the name is only a label.
     potionIds = {49017, 49019, 49021, 49023, 49025, 49027},
+    potionName = "Spiritual prayer potion",
 
-    -- Drink when the pool can no longer pay for a cast.
+    -- Drink when the pool can no longer pay for a cast. Ignored when usePotion
+    -- is false.
     drinkBelowPoints = 20,
 
     -- Renew when the familiar has less than this long left. Familiars:
@@ -102,29 +145,26 @@ local FAMILIAR = {
 }
 
 if FAMILIAR.enabled then
-    -- One pouch, and expect it to cost an extra bank trip the first time.
-    --
-    -- Summoning CONSUMES the pouch, so the moment we summon the count drops to
-    -- zero, the match check fails and War's Retreat banks again. That is not a
-    -- bug to design around — it is what leaves a spare pouch in the bag, which
-    -- is exactly what Familiars:CanRenew needs to top the timer up later. It
-    -- settles after one extra visit: the reload hands us a pouch, the familiar
-    -- is already out so nothing spends it, and the check passes from then on.
     LOADOUT[#LOADOUT + 1] = {
         id = FAMILIAR.pouch,
         amount = 1,
-        name = "Ripper demon pouch"
+        name = FAMILIAR.pouchName
     }
     LOADOUT[#LOADOUT + 1] = {
         id = FAMILIAR.scroll,
         amount = FAMILIAR.scrollAmount,
         name = "Ripper Demon scroll (Death From Above)"
     }
-    LOADOUT[#LOADOUT + 1] = {
-        ids = FAMILIAR.potionIds,
-        amount = 1,
-        name = "Spiritual prayer potion"
-    }
+
+    -- Only when opted in — see FAMILIAR.usePotion for why an unwanted entry here
+    -- is worse than merely redundant.
+    if FAMILIAR.usePotion then
+        LOADOUT[#LOADOUT + 1] = {
+            ids = FAMILIAR.potionIds,
+            amount = 1,
+            name = FAMILIAR.potionName
+        }
+    end
 end
 
 local SCRIPT_VERSION = "0.2.0"
@@ -188,8 +228,18 @@ local LOOT = {
     -- Needed because rares are spotted by scanning the FLOOR rather than by
     -- reading the loot window, and a ground object's own name field is not
     -- something to rely on — see recordUniqueDrops.
+    -- `prefix` is the article the Discord embed puts before the name, defaulting
+    -- to "a " when absent — so plurals set it to "" rather than announcing "a
+    -- Fleeting boots". `thumbnail` is optional: supply a real runescape.wiki
+    -- image URL and the embed shows it, omit it and the embed renders without
+    -- one. See DISCORD_ICON for why none are pre-filled.
     UNIQUES_DATA = {
-        [51082] = {name = "Fleeting boots"},
+        -- The pet. Was missing from this table entirely, so the rare log and the
+        -- Discord embed would both have called the best drop in the game
+        -- "Unique 51102".
+        [51102] = {name = "Broken shackle"},
+
+        [51082] = {name = "Fleeting boots", prefix = ""},
         [51086] = {name = "Shadow spike"},
         [51094] = {name = "Greater Ricochet ability codex"},
         [51096] = {name = "Greater Chain ability codex"},
@@ -202,6 +252,105 @@ local function lootConfigured()
     return (#LOOT.COMMONS + #LOOT.UNIQUES) > 0
 end
 
+------------------------------------------
+-- # ITEM ACTIVATION (ACTION BAR)
+------------------------------------------
+
+-- EVERY item this script activates goes through one of the two functions below —
+-- useBarItem for fixed-name items (the Vulnerability bomb, the familiar pouch,
+-- the gear switches) and useBarPotion for anything with doses (the overload, the
+-- adrenaline potions, the spiritual prayer potion). The split is not cosmetic:
+-- see useBarPotion for why a name lookup silently fails on a potion.
+--
+-- The inventory calls they replaced (Inventory:DoAction, DoAction_Inventory1/2/3,
+-- Inventory:Equip, and the rotation manager's `type = "Inventory"`) are all gone
+-- from this file.
+--
+-- THE PREREQUISITE, because there is no way for the script to fix it: the item
+-- has to be ON the action bar. API.DoAction_Ability resolves by name against the
+-- bar, so an item that is in the bag but not barred simply cannot be used this
+-- way. That is why a miss is logged loudly — an unbarred item otherwise fails in
+-- complete silence, and a script that quietly stops overloading looks like a
+-- dozen other problems before it looks like this one.
+--
+-- Inventory READS are untouched: Inventory:Contains / GetItem still gate every
+-- caller. Those answer "do we have one", which the bar cannot tell us and which
+-- is worth knowing separately from "can we press it".
+
+--- Names we've already warned about, so a missing bar entry logs once rather
+--- than on every attempt. Keyed by item name.
+local barItemWarned = {}
+
+--- True when `name` occupies an action bar slot we can actually press.
+--- @param name string Item name, exactly as it appears on the action bar
+--- @return boolean onBar
+local function barItemReady(name)
+    local ok, ability = pcall(API.GetABs_name, name, true)
+    return (ok and ability and (ability.slot or 0) > 0) and true or false
+end
+
+--- Logs a missing bar entry once per key, then never again.
+--- @param key string
+--- @param message string
+local function warnBarItemOnce(key, message)
+    if barItemWarned[key] then return end
+    barItemWarned[key] = true
+    Utils:log(message, "warn")
+end
+
+--- Uses an item from the ACTION BAR instead of clicking it in the inventory.
+--- See the section note above for the prerequisite this carries.
+---
+--- NAMED items only — things whose bar label never changes, like the bomb, the
+--- pouch and the gear switches. Potions must NOT come through here; see
+--- useBarPotion below for why.
+--- @param name string Item name, exactly as it appears on the action bar
+--- @param optional? boolean Suppress the warning — for callers trying several
+---        candidate names, which must not complain about the ones you didn't bar
+--- @return boolean used
+local function useBarItem(name, optional)
+    if not barItemReady(name) then
+        if not optional then
+            warnBarItemOnce(name, string.format(
+                                "'%s' is not on the action bar — this script activates items from the bar, so it will never be used until you put it there",
+                                name))
+        end
+        return false
+    end
+    return Utils:useAbility(name) and true or false
+end
+
+--- Uses a multi-dose POTION from the action bar, matched by ICON ID.
+---
+--- Potions cannot go through useBarItem, and assuming they could is what stopped
+--- the adrenaline drink working. The bar labels a potion WITH ITS DOSE —
+--- "Adrenaline renewal potion (4)" — while Utils:useAbility resolves through
+--- API.DoAction_Ability with exact_match set to true. A base name therefore
+--- never matches a barred potion, the press silently does nothing, and the only
+--- symptom is a potion that is never drunk.
+---
+--- API.GetAB_ids exists for exactly this case: api.lua documents it as matching
+--- bar slots by icon id "in order of input, for potions ... full dose to
+--- smaller". It hands back the slot, which DoAction_Ability_Direct presses.
+---
+--- Taking the whole id array also restores what the old inventory call did — ONE
+--- call covering both adrenaline potions and every dose of each, in preference
+--- order — so there is no longer a list of names to keep in sync.
+--- @param ids number[] Item ids, fullest/preferred dose first
+--- @param label string Human name, for the warning when none of them are barred
+--- @return boolean used
+local function useBarPotion(ids, label)
+    local ok, ab = pcall(API.GetAB_ids, ids)
+    if not ok or not ab or (ab.slot or 0) <= 0 then
+        warnBarItemOnce(label, string.format(
+                            "No '%s' on the action bar — this script activates items from the bar, so bar one or it will never be drunk",
+                            label))
+        return false
+    end
+    return API.DoAction_Ability_Direct(ab, 1,
+                                       API.OFF_ACT_GeneralInterface_route) and
+               true or false
+end
 
 ------------------------------------------
 -- # BUFFS
@@ -287,10 +436,18 @@ local BUFFS = {
         -- an absent buff counts as expired.
         buffName = "Elder overload",
         buffId = 49039,
-        canApply = function() return Inventory:Contains(ELDER_OVERLOAD_IDS) end,
+        -- ContainsAny, NOT Contains. Contains with a table asks whether the bag
+        -- holds ALL of them — every dose from 1 to 6 at once — which is never
+        -- true, so this gate was refusing the overload outright. ContainsAny is
+        -- the "have we got any dose" question actually meant here, and is what
+        -- rasial/presets.lua uses for the same kind of list.
+        canApply = function()
+            return Inventory:ContainsAny(ELDER_OVERLOAD_IDS)
+        end,
+        -- By id, not name: the bar labels a potion with its dose, so a name
+        -- lookup never matches one. See useBarPotion.
         execute = function()
-            return Inventory:DoAction("Elder overload potion", 1,
-                                      API.OFF_ACT_GeneralInterface_route)
+            return useBarPotion(ELDER_OVERLOAD_IDS, "Elder overload potion")
         end,
         refreshAt = math.random(10, 20)
     }
@@ -336,6 +493,74 @@ CONFIG.scriptVersion = SCRIPT_VERSION
 -- inventory no longer matches this list, so an EMPTY LOADOUT means no banking.
 CONFIG.preset = {inventory = LOADOUT, equipment = {}}
 
+------------------------------------------
+-- # DISCORD NOTIFICATIONS
+------------------------------------------
+
+-- Placed HERE, below CONFIG, and not up with the other constants — these close
+-- over CONFIG, and CONFIG is a local. Defined any earlier, the name would not
+-- resolve to it: Lua would compile the reference as a GLOBAL lookup, which is
+-- nil, and the first notification would error instead of sending.
+
+--- Icon used for the embed author and footer.
+---
+--- EMPTY BY DEFAULT, deliberately. Rasial hardcodes runescape.wiki thumbnail
+--- URLs, and those carry a content hash — an invented one 404s and the embed
+--- renders with a broken image rather than no image. Paste a real URL here
+--- (right-click the picture on the wiki, copy image address) and every embed
+--- picks it up; leave it empty and they render cleanly without an icon.
+local DISCORD_ICON = ""
+
+--- Embed colours, matching Rasial's.
+local DISCORD_COLOR = {
+    drop = 10181046, -- purple, for a unique
+    death = 15158332 -- red
+}
+
+--- True when embeds are switched on in the GUI.
+---
+--- Note this is the ONLY thing the setting controls. The webhook URL itself
+--- lives in the client's settings.json, which Discord:SendEmbedEx reads; with no
+--- URL configured there, sending is a harmless no-op.
+--- @return boolean
+local function discordEnabled() return CONFIG.useDiscord == true end
+
+--- Author block shared by every embed, so the script name and version are
+--- reported identically wherever the embed came from.
+--- @return table
+local function discordAuthor()
+    ---@diagnostic disable-next-line: undefined-global
+    return EmbedAuthor.new(string.format("[%s] Raksha", SCRIPT_VERSION), "",
+                           DISCORD_ICON, "")
+end
+
+--- @param text string
+--- @return table
+local function discordFooter(text)
+    ---@diagnostic disable-next-line: undefined-global
+    return EmbedFooter.new(text, DISCORD_ICON, "")
+end
+
+--- Sends an embed, swallowing anything that goes wrong.
+---
+--- Wrapped in pcall on purpose: a notification is the least important thing this
+--- script does, and it reaches out to the network. A webhook that is
+--- misconfigured, rate limited or simply down must never take the fight down
+--- with it — least of all the DEATH embed, which fires in the middle of the
+--- recovery flow.
+--- @param embed table
+--- @param what string For the log line if it fails
+local function sendDiscord(embed, what)
+    local ok, err = pcall(function()
+        ---@diagnostic disable-next-line: undefined-global
+        return Discord:SendEmbedEx(embed, true)
+    end)
+    if not ok then
+        Utils:log(string.format("Discord %s notification failed: %s", what,
+                                tostring(err)), "warn")
+    end
+end
+
 -- Scale the phase thresholds for the party we are actually in, BEFORE anything
 -- reads them. Raksha has double the life points in a duo and every transition
 -- doubles with them, so this decides which rotation loads when — see
@@ -352,6 +577,11 @@ do
     local m = CONFIG.mechanics
     Constants.ADDS.ANIMA_POOL.ignore = m.ignoreAnimaPools
     Constants.ADDS.ANIMA_POOL.killThreshold = m.poolKillThreshold
+    -- Phase 3 too, and this is the one that matters: handleAnimaPools prefers
+    -- killThresholdByPhase over killThreshold, and phase 3 is the only phase with
+    -- a finite entry. Setting only killThreshold above left the slider with
+    -- nothing to affect.
+    Constants.ADDS.ANIMA_POOL.killThresholdByPhase[3] = m.poolKillThreshold
     Constants.ADDS.ANIMA_POOL.diveDistance = m.poolDiveDistance
     Constants.SHADOW_FLOOR.triggerRange = m.shadowTriggerRange
     Constants.SHADOW_FLOOR.safeRange = m.shadowSafeRange
@@ -520,6 +750,43 @@ local function recordUniqueDrops(drops)
 
         Utils:log(string.format("RARE DROP: %s on kill #%d (%d gp)", name,
                                 Common.killCount, value), "warn")
+
+        if discordEnabled() then
+            ---@diagnostic disable-next-line: undefined-global
+            local embed = DiscordEmbed.new()
+                              :SetTitle(string.format(
+                                            "Congratulations! You found %s%s",
+                                            (data and data.prefix) or "a ", name))
+                              :SetDescription(string.format(
+                                                  "Raksha coughed up a **%s**!",
+                                                  name))
+                              :SetColor(DISCORD_COLOR.drop)
+                              :SetTimestamp(tostring(os.time()))
+                              :SetAuthor(discordAuthor())
+
+            -- Thumbnail only when we actually have a URL for that item, so an
+            -- entry without one renders plainly instead of showing a broken
+            -- image. See DISCORD_ICON for why none are filled in by default.
+            if data and data.thumbnail and data.thumbnail ~= "" then
+                ---@diagnostic disable-next-line: undefined-global
+                embed:SetThumbnail(EmbedImage.new(data.thumbnail,
+                                                  data.thumbnail, 50, 50))
+            end
+
+            ---@diagnostic disable-next-line: undefined-global
+            embed:AddField(EmbedField.new("Kill Count",
+                                          tostring(Common.killCount), true))
+            ---@diagnostic disable-next-line: undefined-global
+            embed:AddField(EmbedField.new("Value",
+                                          string.format("%d gp", value), true))
+            ---@diagnostic disable-next-line: undefined-global
+            embed:AddField(EmbedField.new("Runtime", API.ScriptRuntimeString(),
+                                          true))
+            embed:SetFooter(discordFooter(
+                                "Thank you for using Sonson's Scripts"))
+
+            sendDiscord(embed, "rare drop")
+        end
     end
 end
 
@@ -985,6 +1252,14 @@ end
 
 --- Equips an item only when it is actually carried. An account without the
 --- switch skips the step entirely instead of stalling on a failed equip.
+---
+--- Equipped FROM THE ACTION BAR: a worn item sitting on the bar equips when
+--- activated, so the switch is one bar press rather than an inventory click. The
+--- carried check stays on the inventory, since that is the question it answers.
+---
+--- Returns true either way, exactly as the Inventory:Equip version did — the
+--- result was never checked there either, and a switch that reports failure here
+--- would stall the 0-tick spec sequences this feeds.
 --- @param name string
 --- @param wait? number
 --- @return table
@@ -994,7 +1269,7 @@ local function equipIfCarried(name, wait)
         type = "Custom",
         condition = function() return #Inventory:GetItem(name) > 0 end,
         action = function()
-            Inventory:Equip(name)
+            useBarItem(name)
             return true
         end,
         wait = wait or 1,
@@ -1017,15 +1292,18 @@ local function restoreNecroWeapons(wait)
         label = "Re-equip Necromancy weapons",
         type = "Custom",
         action = function()
+            -- Bar activation for the equip, inventory read to pick WHICH name —
+            -- the weapon we swapped off is the one now sitting in the bag, and
+            -- that is the one to put back on.
             for _, name in ipairs({SWITCHES.genesisMain, SWITCHES.deathguard}) do
                 if #Inventory:GetItem(name) > 0 then
-                    Inventory:Equip(name)
+                    useBarItem(name)
                     break
                 end
             end
             for _, name in ipairs({SWITCHES.genesisOff, SWITCHES.lantern}) do
                 if #Inventory:GetItem(name) > 0 then
-                    Inventory:Equip(name)
+                    useBarItem(name)
                     break
                 end
             end
@@ -1158,17 +1436,26 @@ local function adrenalinePotion(wait)
         -- failure every attempt on a bag that ran out, which reads in the log
         -- exactly like a click that keeps missing.
         condition = function()
-            if not Inventory:Contains(ADRENALINE_POTION_IDS) then return false end
+            -- ContainsAny, NOT Contains. This is why the potion was never drunk
+            -- even back when the drink was an inventory click: Contains with a
+            -- table asks whether the bag holds ALL ten ids — both potions, every
+            -- dose of each, simultaneously — which cannot happen, so the
+            -- condition was false on every attempt and the step fell straight
+            -- through to its replacementAction. rasial/presets.lua has always
+            -- used ContainsAny here; this copy did not.
+            if not Inventory:ContainsAny(ADRENALINE_POTION_IDS) then
+                return false
+            end
             return API.GetAdrenalineFromInterface() < 100
         end,
         action = function()
             playerManager:dontDrink(ADREN_POTION_DONT_DRINK)
-            -- DoAction_Inventory2, not ...3: the by-NAME variant can only ever
-            -- name one potion, which is what tied this step to the renewal. The
-            -- id-array variant takes both potions and every dose of each in a
-            -- single call, so nothing here has to know what you brought.
-            return API.DoAction_Inventory2(ADRENALINE_POTION_IDS, 0, 1,
-                                           API.OFF_ACT_GeneralInterface_route)
+
+            -- One call, the whole id array, preference order preserved — the
+            -- same contract the old DoAction_Inventory2 had, because GetAB_ids
+            -- matches the bar by icon id rather than by name. Nothing here has
+            -- to know which potion you brought or what dose is left.
+            return useBarPotion(ADRENALINE_POTION_IDS, "adrenaline potion")
         end,
         wait = wait or 3,
         useTicks = true,
@@ -1207,6 +1494,7 @@ local FIGHT_ROTATION = {
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
     {label = "Life Transfer", wait = 2, useTicks = true},
+    {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Invoke Lord of Bones", wait = 2, useTicks = true},
     {label = "Surge", wait = 3, useTicks = true},
     {label = "Surge", wait = 2, useTicks = true},
@@ -1249,9 +1537,13 @@ local FIGHT_ROTATION = {
     -- we're targeting, so acquiring him first is what puts it under him.
     targetRaksha(1),
     {label = "Split Soul", wait = 2, useTicks = true},
-        {
+    {
         label = "Vulnerability bomb",
-        type = "Inventory",
+        -- Custom rather than `type = "Inventory"`: that step type resolves
+        -- through the rotation manager's DoAction_Inventory3, which clicks the
+        -- bag. Thrown from the action bar instead, like every other item here.
+        type = "Custom",
+        action = function() return useBarItem("Vulnerability bomb") end,
         wait = 1,
         useTicks = true,
         setupBoundary = true
@@ -1259,9 +1551,8 @@ local FIGHT_ROTATION = {
 
     -- "tc + Bloat": re-acquire Raksha, then open the damage.
     targetRaksha(1),
-    {label = "Bloat", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
-    volleyOfSouls(3),
+    {label = "Bloat", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Divert", wait = 4, useTicks = true},
     {label = "Touch of Death", wait = 4, useTicks = true},
@@ -1301,15 +1592,18 @@ local PHASE2_ROTATION = {
     {label = "Touch of Death", wait = 3, useTicks = true},
     -- Death Skulls runs long; Rasial gives it 4 inside the Living Death window.
     {label = "Death Skulls", wait = 4, useTicks = true},
-    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
+    volleyOfSouls(4),
     fingerOfDeath(4),
     fingerOfDeath(3),
     {label = "Soul Sap", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
+    {label = "Soul Sap", wait = 2, useTicks = true}, -- weaves off Death Skulls
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Touch of Death", wait = 3, useTicks = true},
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    volleyOfSouls(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
 
     -- "improvise basics if not phased"
@@ -1319,25 +1613,13 @@ local PHASE2_ROTATION = {
 ------------------------------------------
 -- # PHASE 3 ROTATION
 ------------------------------------------
-
---- PVME phase 3, in full:
----   Finger of death -> Finger of death -> Basic -> Death skulls -> Bloat ->
----   Volley of souls -> Threads of fate + target pools -> Soul sap ->
----   target Raksha + Volley of souls
----
---- "Threads of fate + target pools" is the one step that hands control away.
---- It casts the AoE and then ARMS the pool clear; from the next tick
---- mechanics:handleAnimaPools owns the target and the abilities, and this
---- rotation is held (see Mechanics:rotationOnHold) until the last pool is dead.
---- We resume at the Soul Sap below with Raksha re-acquired. Chasing the pools
---- from here as well is what had two layers fighting over the target.
 local PHASE3_ROTATION = {
     fingerOfDeath(3),
     fingerOfDeath(3),
     {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Death Skulls", wait = 4, useTicks = true},
     {label = "Bloat", wait = 3, useTicks = true},
-    volleyOfSouls(3),
+    volleyOfSouls(4),
     {
         label = "Threads of Fate + target pools",
         type = "Custom",
@@ -1348,14 +1630,30 @@ local PHASE3_ROTATION = {
         wait = 3,
         useTicks = true
     },
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
     {label = "Soul Sap", wait = 3, useTicks = true},
 
     -- "target Raksha + Volley of souls" — the pool clear leaves us on the
     -- cluster, and the Volley that follows has to land on the boss.
     targetRaksha(1),
+    {
+        label = "Vulnerability bomb",
+        -- Custom rather than `type = "Inventory"`: that step type resolves
+        -- through the rotation manager's DoAction_Inventory3, which clicks the
+        -- bag. Thrown from the action bar instead, like every other item here.
+        type = "Custom",
+        action = function() return useBarItem("Vulnerability bomb") end,
+        wait = 1,
+        useTicks = true,
+        setupBoundary = true
+    },
     volleyOfSouls(3),
-
-    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = true, wait = 3, useTicks = true}
+    {label = "Basic<nbsp>Attack", wait = 3, useTicks = true},
+    {label = "Bloat", wait = 3, useTicks = true},
+    {label = "Soul Sap", wait = 3, useTicks = true},
+    {label = "Bloat", wait = 3, useTicks = true},
+    {label = "Touch of Death", wait = 3, useTicks = true},
+    {label = "Improvise", type = "Improvise", style = "Necromancy", spend = false, wait = 3, useTicks = true}
 }
 
 ------------------------------------------
@@ -1485,7 +1783,11 @@ local PHASE4_ROTATION = {
     adrenalinePotion(4),
     {
         label = "Vulnerability bomb",
-        type = "Inventory",
+        -- Custom rather than `type = "Inventory"`: that step type resolves
+        -- through the rotation manager's DoAction_Inventory3, which clicks the
+        -- bag. Thrown from the action bar instead, like every other item here.
+        type = "Custom",
+        action = function() return useBarItem("Vulnerability bomb") end,
         wait = 1,
         useTicks = true,
         setupBoundary = true
@@ -1902,20 +2204,30 @@ local INSTANCE_CONFIRM_COMPONENT = 56
 --- confirms through component 56, so the ids belong to the same layout.
 local INSTANCE_MAX_PLAYERS_COMPONENT = 68
 
---- Varbit holding when the current instance EXPIRES, as an absolute count of
---- minutes since the epoch. Zero/absent means we have no instance.
+--- Varbit holding when OUR instance expires, as an absolute count of minutes
+--- since the epoch. Zero/absent means we have no instance.
 ---
---- This replaces timing the instance ourselves from os.clock(). Ours was a guess
---- that started when we thought we'd made an instance and got thrown away on
---- every script restart; this is the game's own number, so it stays correct
---- across restarts and tells us how long is actually left rather than how long
---- we think has passed.
+--- Private to this script on purpose. This lived in core.helper for a while as a
+--- shared static (Utils.INSTANCE_EXPIRY_VARBIT) because Raksha and Rasial read
+--- the same number — but the instance belongs to the script that made it, so the
+--- id and the read that consumes it stay local and each script carries its own
+--- isInstanceValid.
 local INSTANCE_EXPIRY_VARBIT = 9925
 
 --- Minutes that must remain before we'll rejoin rather than make a fresh
---- instance. A Raksha kill plus the walk in runs a few minutes, so rejoining one
---- about to expire would strand us mid-fight.
-local INSTANCE_MIN_MINUTES = 6
+--- instance.
+---
+--- 1 — rejoin whenever the instance has ANY time left on it.
+---
+--- There is no mid-fight risk in rejoining a nearly-expired instance. The timer
+--- reaching 00:00 does NOT evict you: the instance keeps running and the kill
+--- finishes normally. What 00:00 means is that it can no longer be rejoined, so
+--- the next trip has to build a fresh one — which is exactly what a reading of 0
+--- produces here.
+---
+--- This was 6, guarding against a mid-fight expiry that does not happen. All it
+--- achieved was abandoning instances with several usable minutes left on them.
+local INSTANCE_MIN_MINUTES = 1
 
 --- Seconds to leave the instance flow alone after a successful creation.
 ---
@@ -1953,24 +2265,60 @@ local RakshaLobby = {
     }
 }
 
+--- Last minutes-left value logged, so the diagnostic prints on change rather
+--- than on every pass of the lobby task.
+local loggedMinutesLeft = nil
+
 --- Minutes left on the current instance; 0 when there isn't one.
+---
+--- Read through VB_FindPSettinOrder, which hands the value back as a
+--- settings-order entry with the number on `.state`. NOT API.GetVarbitValue —
+--- that one is still in api.lua but reads the varbit namespace out of the cache
+--- and returns a bare number (-1 when the cache is not loaded), so it is neither
+--- a drop-in nor the same lookup.
+---
+--- pcall'd because the native read can throw rather than return, which would
+--- take the whole script down from inside a task.
+---
+--- A 0 here is ambiguous: it means "no instance" AND "the game has not populated
+--- the varbit yet", which is why the create path has INSTANCE_CREATE_GRACE.
 --- @return number
 local function instanceMinutesLeft()
-    local expiry = API.VB_FindPSettinOrder(INSTANCE_EXPIRY_VARBIT)
-    if not expiry or type(expiry.state) ~= "number" or expiry.state <= 0 then
+    local ok, expiry = pcall(API.VB_FindPSettinOrder, INSTANCE_EXPIRY_VARBIT)
+    if not ok or not expiry or type(expiry.state) ~= "number" or
+        expiry.state <= 0 then
         return 0
     end
 
     -- The varbit is an absolute wall-clock minute, so this compares against the
-    -- local clock rather than any elapsed time we tracked. The -1 discards the
-    -- partial minute we're currently inside.
+    -- local clock rather than any elapsed time we tracked ourselves. The -1
+    -- discards the partial minute we are currently inside.
     --
-    -- Floored so the result is always an integer: the caller logs it with %d,
-    -- and %d on a float without an exact integer representation raises "bad
-    -- argument to 'format'" in Lua 5.3+. Cheap insurance against the varbit ever
-    -- reading back as a float.
-    local nowMinutes = math.floor(os.time() / 60)
-    return math.floor(expiry.state - nowMinutes) - 1
+    -- Floored so the result is always an integer: it is logged with %d, and %d
+    -- on a float without an exact integer representation raises "bad argument to
+    -- 'format'" in Lua 5.3+.
+    local left = math.floor(expiry.state - math.floor(os.time() / 60)) - 1
+    if left < 0 then left = 0 end
+
+    if loggedMinutesLeft ~= left then
+        loggedMinutesLeft = left
+        Utils:log(string.format(
+                      "Instance timer: %d min left (varbit %d reads %d)", left,
+                      INSTANCE_EXPIRY_VARBIT, expiry.state), "debug")
+    end
+
+    return left
+end
+
+--- True when we already own an instance worth rejoining, with the minutes left
+--- alongside it for the log line at the call site.
+---
+--- Below INSTANCE_MIN_MINUTES this deliberately says no and we build fresh:
+--- rejoining one that expires mid-kill is worse than the rebuild it avoids.
+--- @return boolean, number
+local function isInstanceValid()
+    local minutesLeft = instanceMinutesLeft()
+    return minutesLeft >= INSTANCE_MIN_MINUTES, minutesLeft
 end
 
 --- True while the instance settings window is on screen.
@@ -2287,14 +2635,14 @@ function RakshaLobby:handleInstance()
     -- Rejoin only when the game says there is genuinely enough time left on the
     -- instance; otherwise make a fresh one.
     --
-    -- The expiry comes straight from varbit 9925 now, so this survives a script
-    -- restart and knows the real remaining time. The old check compared
-    -- os.clock() against an instanceStartTime we set ourselves, which reset to 0
-    -- every launch and therefore made a brand new instance on the first trip of
-    -- every session — throwing away whatever was still live.
-    local minutesLeft = instanceMinutesLeft()
+    -- The expiry comes straight from our own expiry varbit read, so this
+    -- survives a script restart and knows the real remaining time. The old check
+    -- compared os.clock() against an instanceStartTime we set ourselves, which
+    -- reset to 0 every launch and therefore made a brand new instance on the
+    -- first trip of every session — throwing away whatever was still live.
+    local valid, minutesLeft = isInstanceValid()
 
-    if minutesLeft < INSTANCE_MIN_MINUTES or self.variables.rejoinAttempts > 3 then
+    if not valid or self.variables.rejoinAttempts > 3 then
         if minutesLeft > 0 then
             Utils:log(string.format(
                           "Instance has only %d min left — creating a fresh one",
@@ -3093,8 +3441,10 @@ timer:addTask({
     end,
     action = function()
         Utils:log("Summoning Ripper Demon", "info")
-        return API.DoAction_Inventory1(FAMILIAR.pouch, 0, 1,
-                                       API.OFF_ACT_GeneralInterface_route)
+        -- Summoned off the action bar. FAMILIAR.pouch is an id, which the bag
+        -- check above still uses; the bar needs the name, so that comes from
+        -- FAMILIAR.pouchName alongside it.
+        return useBarItem(FAMILIAR.pouchName)
     end,
     executionData = {lastRun = 0, count = 0}
 })
@@ -3134,14 +3484,17 @@ timer:addTask({
 
 -- Top the special move pool back up with a Spiritual prayer potion.
 --
--- Runs in the fight as well as at War's Retreat, because 60 points is only three
--- casts and the pool is what turns the familiar from a passive damage source
--- into a specced one. A dose gives 15 points back plus prayer and summoning,
--- none of which is ever wasted here.
+-- OPTIONAL, and inert unless FAMILIAR.usePotion is set. Without it the familiar
+-- still summons, renews and specs — it just spends the starting 60 points (three
+-- casts) and then waits on natural regeneration instead of topping up.
+--
+-- When it is on: runs in the fight as well as at War's Retreat, because the pool
+-- is what turns the familiar from a passive damage source into a specced one. A
+-- dose gives 15 points back plus prayer and summoning, none of it wasted here.
 --
 -- dontDrink pauses the player manager around it for the same reason the
--- adrenaline potion does: two inventory clicks in one tick means one is thrown
--- away, and the one we lose is whichever went second.
+-- adrenaline potion does: two drinks in one tick means one is thrown away, and
+-- the one we lose is whichever went second.
 timer:addTask({
     name = "Drinking spiritual prayer potion",
     priority = 69,
@@ -3150,6 +3503,7 @@ timer:addTask({
     parallel = true,
     condition = function()
         if not FAMILIAR.enabled then return false end
+        if not FAMILIAR.usePotion then return false end
         if Common.isDead then return false end
         if not familiarOut() then return false end
         if familiarPoints() >= FAMILIAR.drinkBelowPoints then return false end
@@ -3160,8 +3514,9 @@ timer:addTask({
         Utils:log(string.format(
                       "Special move points at %d — drinking spiritual prayer potion",
                       familiarPoints()), "info")
-        return API.DoAction_Inventory2(FAMILIAR.potionIds, 0, 1,
-                                       API.OFF_ACT_GeneralInterface_route)
+        -- By id, like the other potions: the bar labels each dose separately, so
+        -- a name lookup would never match. See useBarPotion.
+        return useBarPotion(FAMILIAR.potionIds, FAMILIAR.potionName)
     end,
     executionData = {lastRun = 0, count = 0}
 })
@@ -3515,6 +3870,37 @@ timer:addTask({
             Common.deathCount = Common.deathCount + 1
             Utils:log(string.format("DEATH DETECTED! Death count: %d",
                                     Common.deathCount), "error")
+
+            -- Sent from inside the `not Common.isDead` branch, which is the
+            -- one-shot: this condition runs every 2 ticks for the whole recovery,
+            -- so anywhere else would post an embed per tick until we got back.
+            if discordEnabled() then
+                ---@diagnostic disable-next-line: undefined-global
+                local embed = DiscordEmbed.new()
+                                  :SetTitle("Death Notification")
+                                  :SetDescription(
+                                      "Your character has died during the Raksha fight.")
+                                  :SetColor(DISCORD_COLOR.death)
+                                  :SetTimestamp(tostring(os.time()))
+                                  :SetAuthor(discordAuthor())
+
+                ---@diagnostic disable-next-line: undefined-global
+                embed:AddField(EmbedField.new("Death Count",
+                                              tostring(Common.deathCount), true))
+                ---@diagnostic disable-next-line: undefined-global
+                embed:AddField(EmbedField.new("Kill Count",
+                                              tostring(Common.killCount), true))
+                ---@diagnostic disable-next-line: undefined-global
+                embed:AddField(EmbedField.new("Phase",
+                                              tostring(mechanics.state.phase),
+                                              true))
+                ---@diagnostic disable-next-line: undefined-global
+                embed:AddField(EmbedField.new("Runtime",
+                                              API.ScriptRuntimeString(), true))
+                embed:SetFooter(discordFooter("Recovery in progress..."))
+
+                sendDiscord(embed, "death")
+            end
         end
 
         return Common.isDead

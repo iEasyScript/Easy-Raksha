@@ -39,6 +39,13 @@ RakshaGUI.config = {
     waitForFullHp = true,
     useRevolution = false,
 
+    -- Discord embeds on death and on a unique drop, same as Rasial.
+    --
+    -- The WEBHOOK URL is not a script setting: Discord:SendEmbedEx posts to the
+    -- url in the client's own settings.json, so this only decides whether we
+    -- send anything. With no url configured there, sending is simply a no-op.
+    useDiscord = true,
+
     -- Party / duo. Modelled on kerapac/config.lua, which uses the same three
     -- settings: are we in a party at all, are we the one who owns the instance,
     -- and who is the owner if it isn't us.
@@ -84,7 +91,7 @@ RakshaGUI.config = {
 
     -- Raksha mechanics
     ignoreAnimaPools = false,
-    poolKillThreshold = 10,
+    poolKillThreshold = 6,
     poolDiveDistance = 8,
     -- Measured from the edge of the shadow's 4x4 box, not its centre, so these
     -- stay small — larger values make a big exclusion zone and we shuffle
@@ -226,6 +233,7 @@ local function saveConfigToFile(cfg)
         BankPin = cfg.bankPin,
         WaitForFullHp = cfg.waitForFullHp,
         UseRevolution = cfg.useRevolution,
+        UseDiscord = cfg.useDiscord,
         InParty = cfg.inParty,
         IsPartyLeader = cfg.isPartyLeader,
         PartyLeader = cfg.partyLeader,
@@ -356,6 +364,7 @@ function RakshaGUI.loadConfig()
     str("BankPin", "bankPin")
     bool("WaitForFullHp", "waitForFullHp")
     bool("UseRevolution", "useRevolution")
+    bool("UseDiscord", "useDiscord")
 
     bool("InParty", "inParty")
     bool("IsPartyLeader", "isPartyLeader")
@@ -410,6 +419,7 @@ function RakshaGUI.getConfig()
         waitForFullHp = c.waitForFullHp,
         useRevolution = c.useRevolution,
         usePrebuild = c.usePrebuild,
+        useDiscord = c.useDiscord,
 
         party = {
             inParty = c.inParty,
@@ -703,6 +713,14 @@ local function drawPlayerManagerTab(cfg)
     cfg.prayerSpecial = ui:labeledInputInt("Elven shard below (points)",
                                            "##prayerSpecial", cfg.prayerSpecial,
                                            10)
+
+    ui:separator()
+    ui:sectionHeader("Notifications", "Configure alerts and notifications.")
+
+    cfg.useDiscord = ui:checkbox("Discord Notifications##discord",
+                                 cfg.useDiscord)
+    ui:text("Embeds on death and on a unique drop. The webhook URL comes " ..
+                "from the client's settings.json, not from here.", "hint")
 end
 
 --------------------------------------------------------------------------------
@@ -722,11 +740,14 @@ local function drawMechanicsTab(cfg)
 
     if not cfg.ignoreAnimaPools then
         ui:spacing(1)
-        cfg.poolKillThreshold = ui:labeledSliderInt("Start clearing at (pools)",
+        cfg.poolKillThreshold = ui:labeledSliderInt("Tolerate up to (pools)",
                                                     "##poolThreshold",
                                                     cfg.poolKillThreshold, 1, 20,
                                                     "%d")
-        ui:text("Fewer than this are ignored so we keep DPSing the boss.", "hint")
+        ui:text("Phase 3 only. This many standing is fine and we stay on " ..
+                    "Raksha; above it we clear back down to this number and " ..
+                    "return to him. An announced siphon still clears them all.",
+                "hint")
 
         cfg.poolDiveDistance = ui:labeledSliderInt(
                                    "Dive when further than (tiles)", "##poolDive",

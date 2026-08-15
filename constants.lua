@@ -189,6 +189,10 @@ function Constants.setPartySize(size)
     local pool = Constants.ADDS.ANIMA_POOL
     pool.startBelowHpInPhase3 = pool.startBelowHpInPhase3Solo * size
     pool.skipBelowHpInPhase3 = pool.skipBelowHpInPhase3Solo * size
+
+    -- Same treatment for the manifestation's endgame skip.
+    local manifestation = Constants.ADDS.SHADOW_MANIFESTATION
+    manifestation.skipBelowHp = manifestation.skipBelowHpSolo * size
 end
 
 --- Phase 4 is a different, smaller arena and Raksha heals back to 400k on entry
@@ -342,8 +346,13 @@ Constants.ADDS = {
         -- them, still far inside Necromancy's attack range.
         avoidClearance = 2,
 
-        -- Threshold to START clearing, per phase. PHASE 3 ONLY — see
-        -- killThresholdByPhase below. Once started we always clear to ZERO.
+        -- How many pools we tolerate, per phase. PHASE 3 ONLY — see
+        -- killThresholdByPhase below.
+        --
+        -- Doubles as both ends of the clear: we START clearing when the count
+        -- reaches it and STOP as soon as we are back at or under it, rather than
+        -- killing every pool. A siphon overrides both — once announced, all of
+        -- them go.
         killThreshold = 10,
 
         -- THE PHASE 3 POOL WINDOW: start below `startBelowHpInPhase3`, stop
@@ -389,10 +398,19 @@ Constants.ADDS = {
         --
         -- They remain a MOVEMENT hazard in every phase (avoidClearance above) —
         -- ignoring them means not hunting them, not standing in them.
+        -- Phase 3 is 6: up to six pools standing is acceptable, and above that we
+        -- clear down to six and go straight back on Raksha. Enough that he never
+        -- siphons himself into being unkillable, without spending the phase
+        -- walking the arena.
+        --
+        -- Overwritten by the GUI's pool slider at startup (see main.lua) — this
+        -- is the default, not the last word. It used to be 3 and was NOT being
+        -- overwritten, so the slider silently did nothing for the only phase that
+        -- clears pools at all.
         killThresholdByPhase = {
             [1] = math.huge,
             [2] = math.huge,
-            [3] = 3,
+            [3] = 6,
             [4] = math.huge
         },
 
@@ -428,7 +446,21 @@ Constants.ADDS = {
         action = "Attack",
         id = 27355,
         type = 1, -- NPC
-        range = 60
+        range = 60,
+
+        -- Endgame skip: below this much boss health we ignore the manifestation
+        -- entirely and push damage into Raksha to phase him.
+        --
+        -- Phase 4 starts at 200,000, so 230,000 is the last stretch of phase 3.
+        -- A manifestation that spawns here is not worth killing — the phase
+        -- transition despawns it, and it owns every tick while it lives, so
+        -- fighting it trades the phase push for an add that is about to vanish.
+        --
+        -- SOLO number, rescaled by setPartySize exactly like PHASE_HP and the
+        -- pool gates. Left flat it would never be reached in a duo, where phase 3
+        -- runs 800,000 down to 400,000. Read the live field, never the _SOLO one.
+        skipBelowHpSolo = 230000,
+        skipBelowHp = 230000
     }
 }
 

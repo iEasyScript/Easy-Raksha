@@ -292,10 +292,20 @@ local POOL_DPS_ABILITIES = {
 }
 
 -- How close two pools have to be to count as one cluster when choosing which to
--- attack. Threads of Fate splashes to nearby targets, so we lead on the pool
--- with the most neighbours inside this radius rather than the merely nearest
--- one — killing three at a time instead of one.
+-- attack. Threads of Fate splashes to nearby targets, so among pools that are
+-- about equally close we lead on the one with the most neighbours inside this
+-- radius — killing three at a time instead of one.
+--
+-- Density is now the TIEBREAK, not the primary sort. See pickPoolTarget.
 local POOL_CLUSTER_RADIUS = 3
+
+-- How much closer one pool has to be than another before distance decides on its
+-- own. Inside this band the two count as equally close and the denser cluster
+-- wins; outside it, the nearer pool always wins.
+--
+-- This is what stops us walking past pools at our feet to reach a knot across
+-- the arena, which is exactly what the old density-first ordering did.
+local POOL_DISTANCE_TIE = 1.0
 
 -- Abilities to spend on the Shadow manifestation, best first, once it has been
 -- stunned. Same contract as POOL_DPS_ABILITIES: while it's up the phase
@@ -2134,14 +2144,22 @@ end
 -- # ANIMA POOLS (kill fast, presence-based)
 ------------------------------------------
 
---- Picks the pool that takes the most of the swarm with it.
+--- Picks the NEAREST pool, using cluster density only to break near-ties.
 ---
---- Nearest-first is the obvious choice and it's the wrong one: Threads of Fate
---- splashes to nearby targets, so leading on an isolated pool two tiles away
---- wastes the splash while a knot of four sits five tiles off. Each pool is
---- scored by how many others sit inside POOL_CLUSTER_RADIUS of it and we take
---- the densest, breaking ties on distance so we never cross the arena for a
---- marginally better cluster.
+--- This used to be the other way round — densest cluster first, distance as the
+--- tiebreak — on the reasoning that Threads of Fate splashes, so a knot of four
+--- five tiles away beats an isolated pool two tiles away. That was right when
+--- the rule was "clear to zero": every pool was going to die, so the only
+--- question was what order killed them fastest.
+---
+--- It is wrong now. We clear down to the threshold and go back to Raksha, so we
+--- kill a handful and leave — and the cost of a pool is dominated by the walk to
+--- it, not the casts. Leading on a distant cluster meant crossing the arena
+--- while the near pools we could have shaved off in seconds stayed up.
+---
+--- POOL_DISTANCE_TIE keeps the splash benefit where it is nearly free: pools
+--- within a tile of each other in distance count as equally close, and the
+--- denser of those wins.
 ---
 --- O(n^2) in the pool count, so callers must only use it when they actually
 --- need a new target — not on every pass.
@@ -2167,14 +2185,18 @@ function Mechanics:pickPoolTarget(pools)
             end
         end
 
-        if score > bestScore or (score == bestScore and d < bestDistance) then
+        -- Distance first, cluster only among the near-equally-close.
+        local closer = d < (bestDistance - POOL_DISTANCE_TIE)
+        local sameish = math.abs(d - bestDistance) <= POOL_DISTANCE_TIE
+
+        if best == nil or closer or (sameish and score > bestScore) then
             best, bestScore, bestDistance = p, score, d
         end
     end
 
     if best then
-        self:log(string.format("next pool: %d others within %d tiles, %.1f away",
-                               bestScore, POOL_CLUSTER_RADIUS, bestDistance))
+        self:log(string.format("next pool: %.1f away, %d others within %d tiles",
+                               bestDistance, bestScore, POOL_CLUSTER_RADIUS))
     end
     return best
 end
@@ -2198,9 +2220,13 @@ end
 ---   * Raksha announces the siphon (siphonImminent), or
 ---   * the phase 3 rotation reaches its "target pools" step
 ---     (requestPoolClear).
---- Once started we latch and keep going until ZERO are left — we don't stop the
---- moment the count dips back under the threshold, or we'd leave stragglers
---- healing the boss.
+--- Once started we keep going until the count is back at or under the
+--- threshold, then return to Raksha — the setting is a ceiling on how many pools
+--- we tolerate, not an instruction to kill every one.
+---
+--- The exception is a siphon: once announced, every remaining pool heals him
+--- 5,000 and stacks his damage buff, so that case clears to ZERO regardless of
+--- the count.
 --- @return boolean consumed
 function Mechanics:handleAnimaPools()
     local pool = Constants.ADDS.ANIMA_POOL
@@ -2281,6 +2307,29 @@ function Mechanics:handleAnimaPools()
         return false
     end
 
+    -- ALREADY CLEARING, and back at or under the configured count: stop and
+    -- return to Raksha. We do not need to kill every pool — the setting is a
+    -- ceiling on how many we tolerate, not a target of zero.
+    --
+    -- This used to clear to ZERO once started, on the reasoning that stragglers
+    -- heal him on the next siphon. That still holds WHEN A SIPHON IS COMING, and
+    -- that case is excluded below — every pool he pulls in is 5,000 health and a
+    -- damage-buff stack, so an announced siphon still means all of them go. What
+    -- it does not justify is walking the arena killing the last few pools while
+    -- he stands there untouched and no siphon is pending; that trades real DPS
+    -- for a heal that is not going to happen.
+    if self.state.poolsActive and #pools <= phaseThreshold and
+        not self:siphonImminent() then
+        self.state.poolsActive = false
+        self.state.poolClearRequested = false
+        self.state.poolTargetId = nil
+        self:log(string.format(
+                     "anima pools: %d left (threshold %d) — back to Raksha",
+                     #pools, phaseThreshold))
+        self:reattackBoss()
+        return false
+    end
+
     -- Below the threshold and not already clearing: ignore them and keep DPSing
     -- the boss. Only crossing the threshold — or the phase 3 rotation reaching
     -- its "target pools" step, or Raksha announcing the siphon — starts a clear.
@@ -2312,7 +2361,12 @@ function Mechanics:handleAnimaPools()
         local siphoning = self:siphonImminent()
         local requested = self.state.poolClearRequested
 
-        if not requested and not siphoning and #pools < phaseThreshold then
+        -- `<=`, not `<`: the threshold is the number we TOLERATE, so a count
+        -- equal to it is acceptable and only a count above it starts a clear.
+        -- With `<` the start and stop tests were both "== threshold", so hitting
+        -- the number started a clear that the stop check above cancelled on the
+        -- same tick.
+        if not requested and not siphoning and #pools <= phaseThreshold then
             return false
         end
         self:log(string.format(
@@ -2527,6 +2581,28 @@ end
 --- @return boolean consumed
 function Mechanics:handleShadowManifestation()
     local sm = Constants.ADDS.SHADOW_MANIFESTATION
+
+    -- ENDGAME SKIP: close enough to phase 4 that phasing him beats killing an
+    -- add the transition is about to remove anyway.
+    --
+    -- Checked before the scan so the common case is cheap, and it drops an
+    -- in-progress kill too — the manifestation owns every tick while it lives,
+    -- so a latch that survived into this window would hold the fight right where
+    -- we most want damage going into Raksha.
+    --
+    -- Mirrors the pools' skipBelowHpInPhase3; both are party-scaled.
+    if sm.skipBelowHp and self.state.bossLife > 0 and self.state.bossLife <
+        sm.skipBelowHp then
+        if self.state.manifestationActive then
+            self.state.manifestationActive = false
+            self.state.manifestTargetId = nil
+            self:log(string.format(
+                         "boss at %d hp (< %d) — ignoring manifestation, pushing to phase 4",
+                         self.state.bossLife, sm.skipBelowHp))
+            self:reattackBoss()
+        end
+        return false
+    end
 
     -- LIVE manifestations only — the same filter the pools needed, and the same
     -- reason we were slow coming off it. A manifestation that has just died
@@ -3093,17 +3169,30 @@ function Mechanics:update()
         if consumed then return true end
     end
 
-    -- 5-6. Manifestation, then anima pools — unless an exclusive response is
+    -- 5-6. Anima pools, THEN the manifestation — unless an exclusive response is
     --      still mid-flight, or the lethal-ground dodge owns our movement.
     --      Presence-based, so they run whether or not Raksha is targetable.
+    --
+    --      POOLS GO FIRST. Both handlers own the tick when they act, so whichever
+    --      is tested first starves the other for as long as it is running. With
+    --      the manifestation first, a manifestation that spawned during a pool
+    --      sweep held the tick for its whole life while the pools kept stacking
+    --      up behind it — and pools are the ones that heal Raksha 5,000 apiece on
+    --      the next siphon. The manifestation does not heal him; it just has to
+    --      die reasonably soon.
+    --
+    --      This is bounded now in a way it would not have been before: the pool
+    --      clear stops at the configured count rather than running to zero, so
+    --      the manifestation waits for a handful of kills, not for the arena to
+    --      be swept clean.
     --
     --      The instakillActive check is the movement lock: these handlers Dive,
     --      Surge and walk, so letting them run mid-dodge would fight the dodge
     --      for control of where we stand — which is how you die to the thing you
     --      were already running from.
     if not exclusive and not self.state.instakillActive then
-        if self:handleShadowManifestation() then return true end
         if self:handleAnimaPools() then return true end
+        if self:handleShadowManifestation() then return true end
     end
 
     -- 7. Nothing threatening: drift back to our home tile so the next mechanic
