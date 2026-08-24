@@ -6,8 +6,34 @@
 ------------------------------------------
 
 local API             = require("api")
-local Player          = require("core.player")
-local Utils           = require("core.helper")
+local Player          = require("raksha.core.player")
+local Utils           = require("raksha.core.helper")
+
+
+------------------------------------------
+--# DEBUG LOGGING
+------------------------------------------
+
+--- Set true to get the flicker's step-by-step trace back.
+---
+--- It was ALWAYS ON. PrayerFlicker.new sets `self.DEBUG = false` and nothing
+--- ever read it, while dozens of Utils:log(..., "debug") calls ran
+--- unconditionally through the hottest path in a boss script — several per
+--- threat, per pass, at 10-20 passes a game tick. Each one rebuilt a dispatch
+--- table, formatted a string and pushed a line to the client log, and with
+--- API.SetDrawLogs enabled the client then DREW every one of them.
+---
+--- Module scope rather than the instance, so the guard also covers the calls in
+--- PrayerFlicker.new that run before `self` exists. Only "debug" level calls
+--- were moved behind it: info, warn and error still report unconditionally,
+--- because those are the lines that say something went wrong.
+local DEBUG_LOGGING = false
+
+--- Debug trace line, dropped unless DEBUG_LOGGING is on.
+--- @param message string
+local function dbg(message)
+    if DEBUG_LOGGING then Utils:log(message, "debug") end
+end
 
 ------------------------------------------
 --# TYPE DEFINITIONS
@@ -101,7 +127,7 @@ local instance        = nil
 --- @return PrayerFlicker: Initialized PrayerFlicker instance
 function PrayerFlicker.new(config)
     if instance then
-        Utils:log("Returning existing PrayerFlicker instance", "debug") -- DEBUG
+        dbg("Returning existing PrayerFlicker instance") -- DEBUG
         return instance
     end
 
@@ -112,9 +138,9 @@ function PrayerFlicker.new(config)
     self.DEBUG = false
 
     -- TODO: Assert configurations
-    Utils:log("Validating configuration...", "debug") -- DEBUG
+    dbg("Validating configuration...") -- DEBUG
     if config then
-        Utils:log("Configuration provided", "debug")  -- DEBUG
+        dbg("Configuration provided")  -- DEBUG
     end
 
     self.flickInterval     = 1
@@ -139,7 +165,7 @@ end
 
 --- Retrieves all required prayers from list of threats
 function PrayerFlicker:_getRequiredPrayers()
-    Utils:log("Retrieving required prayers from threats", "debug") -- DEBUG
+    dbg("Retrieving required prayers from threats") -- DEBUG
     local requiredPrayers = {}
 
     if self.defaultPrayer then
@@ -152,7 +178,7 @@ function PrayerFlicker:_getRequiredPrayers()
         if #requiredPrayers > 0 then
             for _, requiredPrayer in ipairs(requiredPrayers) do
                 if requiredPrayer.name == prayer.name then
-                    Utils:log("Prayer already registered: " .. prayer.name, "debug") -- DEBUG
+                    dbg("Prayer already registered: " .. prayer.name) -- DEBUG
                     goto continue
                 end
             end
@@ -161,20 +187,20 @@ function PrayerFlicker:_getRequiredPrayers()
         table.insert(requiredPrayers, prayer)
         ::continue::
     end
-    Utils:log("Total required prayers: " .. #requiredPrayers, "debug") -- DEBUG
+    dbg("Total required prayers: " .. #requiredPrayers) -- DEBUG
     return requiredPrayers
 end
 
 --- Checks to see if the listed prayers exist on available ability bars
 --- @private
 function PrayerFlicker:_checkRequiredPrayers()
-    Utils:log("Checking for required prayers on ability bars", "debug") -- DEBUG
+    dbg("Checking for required prayers on ability bars") -- DEBUG
     local missingPrayers = {}
 
     for _, prayer in pairs(self.prayers) do
-        Utils:log("Checking ability bar for prayer: " .. prayer.name, "debug") -- DEBUG
+        dbg("Checking ability bar for prayer: " .. prayer.name) -- DEBUG
         if #API.GetABs_names({ prayer.name }) < 1 then
-            Utils:log("Prayer missing: " .. prayer.name, "debug")              -- DEBUG
+            dbg("Prayer missing: " .. prayer.name)              -- DEBUG
             table.insert(missingPrayers, prayer.name)
         end
     end
@@ -199,7 +225,7 @@ end
 --- Updates the Prayer Flicker instance
 --- @return boolean: Whether an action was triggered this loop
 function PrayerFlicker:update()
-    Utils:log("Updating PrayerFlicker...", "debug") -- DEBUG
+    dbg("Updating PrayerFlicker...") -- DEBUG
     self:_updateActions()
     return self:_switchPrayer(self:_determinePrayer())
 end
@@ -207,11 +233,11 @@ end
 --- Disables active prayer
 --- @return boolean
 function PrayerFlicker:deactivatePrayer()
-    Utils:log("Attempting to deactivate prayer", "debug") -- DEBUG
+    dbg("Attempting to deactivate prayer") -- DEBUG
     local currentTick = API.Get_tick()
     local prayer = self:_getActivePrayer()
     if not prayer.name or ((currentTick - self.state.activationTick < 1) and not self.state.activePrayer.name) then
-        Utils:log("Deactivation skipped: No active prayer or cooldown", "debug") -- DEBUG
+        dbg("Deactivation skipped: No active prayer or cooldown") -- DEBUG
         return false
     end
 
@@ -241,40 +267,40 @@ end
 
 --- Checks to see if threats exists and adds them to self.pendingActions if they do
 function PrayerFlicker:_getExistingThreats()
-    Utils:log("Scanning for existing threats...", "debug") -- DEBUG
+    dbg("Scanning for existing threats...") -- DEBUG
     local foundThreats = {}
     -- Iterate over list of threats
     for _, threat in ipairs(self.threats) do
-        Utils:log("Checking threat: " .. (threat.name or "Unnamed"), "debug") -- DEBUG
+        dbg("Checking threat: " .. (threat.name or "Unnamed")) -- DEBUG
         if self:_doesThreatExist(threat) then
             if not self:_isThreatInTable(foundThreats, threat) then
                 Utils:log("+ Threat detected: " .. (threat.name or "Unnamed threat"), "warn")
                 table.insert(foundThreats, threat)
             end
         else
-            Utils:log("- Threat not active: " .. (threat.name or "Unnamed"), "debug") -- DEBUG
+            dbg("- Threat not active: " .. (threat.name or "Unnamed")) -- DEBUG
         end
     end
-    Utils:log("Total threats found: " .. #foundThreats, "debug") -- DEBUG
+    dbg("Total threats found: " .. #foundThreats) -- DEBUG
     return foundThreats
 end
 
 function PrayerFlicker:_updateActions()
-    Utils:log("Updating pending actions...", "debug") -- DEBUG
+    dbg("Updating pending actions...") -- DEBUG
     local currentTick = API.Get_tick()
     local threats     = self:_getExistingThreats()
     local actions     = self.pendingActions
     local toAdd       = {}
     local toRemove    = {}
 
-    Utils:log("Current pending actions: " .. #actions, "debug") -- DEBUG
+    dbg("Current pending actions: " .. #actions) -- DEBUG
 
     if #threats > 0 then
-        Utils:log("Processing " .. #threats .. " active threats", "debug") -- DEBUG
+        dbg("Processing " .. #threats .. " active threats") -- DEBUG
         -- Check if threats exist, add to threats.pendingActions
         for _, threat in ipairs(threats) do
             if not self:_isThreatInTable(self.pendingActions, threat) then
-                Utils:log("+ Adding threat: " .. (threat.name or "Unnamed threat"), "debug") -- DEBUG
+                dbg("+ Adding threat: " .. (threat.name or "Unnamed threat")) -- DEBUG
                 table.insert(toAdd, threat)
             end
         end
@@ -288,12 +314,12 @@ function PrayerFlicker:_updateActions()
                     tickAdded = currentTick
                 }
             })
-            Utils:log("Added threat to pending actions: " .. (threat.name or "Unnamed"), "debug") -- DEBUG
+            dbg("Added threat to pending actions: " .. (threat.name or "Unnamed")) -- DEBUG
         end
     end
 
     if #actions > 0 then
-        Utils:log("Processing " .. #actions .. " pending actions", "debug") -- DEBUG
+        dbg("Processing " .. #actions .. " pending actions") -- DEBUG
         for i, action in ipairs(actions) do
             local threatExists = self:_doesThreatExist(action.threat)
             -- If the threat no longer exists
@@ -302,19 +328,19 @@ function PrayerFlicker:_updateActions()
                 -- If no expiration tick set
                 if tickExpired == -1 then
                     action.activationData.tickExpired = currentTick + action.threat.duration
-                    Utils:log("Set expiration tick for threat: " .. (action.threat.name or "Unnamed"), "debug") -- DEBUG
+                    dbg("Set expiration tick for threat: " .. (action.threat.name or "Unnamed")) -- DEBUG
                     goto continue
                 end
                 -- If expiration tick passed
                 if currentTick > tickExpired then
-                    Utils:log("Threat expired: " .. (action.threat.name or "Unnamed threat"), "debug") -- DEBUG
+                    dbg("Threat expired: " .. (action.threat.name or "Unnamed threat")) -- DEBUG
                     table.insert(toRemove, { index = i, action = action })
                     goto continue
                 end
             else
                 -- Threat still exists, make sure no expiration date
                 action.activationData.tickExpired = -1
-                Utils:log("Threat still active: " .. (action.threat.name or "Unnamed"), "debug") -- DEBUG
+                dbg("Threat still active: " .. (action.threat.name or "Unnamed")) -- DEBUG
             end
             ::continue::
         end
@@ -325,11 +351,11 @@ function PrayerFlicker:_updateActions()
         return a.index < b.index
     end)
     for _, record in ipairs(toRemove) do
-        Utils:log("Removing expired action: " .. (record.action.threat.name or "Unnamed"), "debug") -- DEBUG
+        dbg("Removing expired action: " .. (record.action.threat.name or "Unnamed")) -- DEBUG
         table.remove(self.pendingActions, record.index)
     end
 
-    Utils:log("Pending actions after update: " .. #self.pendingActions, "debug") -- DEBUG
+    dbg("Pending actions after update: " .. #self.pendingActions) -- DEBUG
 end
 
 ------------------------------------------
@@ -343,11 +369,11 @@ function PrayerFlicker:_doesThreatExist(threat)
     --- @type ThreatType
     local threatType = threat.type
     local threatExists = false
-    Utils:log(string.format("Checking for threat [%s]: %s", threat.type, threat.name or "Unnamed threat"), "debug")
+    dbg(string.format("Checking for threat [%s]: %s", threat.type, threat.name or "Unnamed threat"))
 
     -- Projectile threat checks
     if threatType == "Projectile" then
-        Utils:log(string.format("Checking projectile ID %d (range %d)", threat.id, threat.range or 60), "debug") -- DEBUG
+        dbg(string.format("Checking projectile ID %d (range %d)", threat.id, threat.range or 60)) -- DEBUG
         threatExists = self:_projectileExists(threat.id, threat.range)
         goto continue
     end
@@ -361,16 +387,16 @@ function PrayerFlicker:_doesThreatExist(threat)
 
     -- Conditional threat checks
     if threatType == "Conditional" then
-        Utils:log("Checking conditional threat", "debug") -- DEBUG
+        dbg("Checking conditional threat") -- DEBUG
         threatExists = self:_conditionalThreatExists(threat.condition)
         goto continue
     end
     ::continue::
     if threat.bypassCondition and threat.bypassCondition() then
-        Utils:log("Threat bypassed by condition", "debug") -- DEBUG
+        dbg("Threat bypassed by condition") -- DEBUG
         return false
     end
-    Utils:log("Threat exists: " .. tostring(threatExists), "debug") -- DEBUG
+    dbg("Threat exists: " .. tostring(threatExists)) -- DEBUG
     return threatExists
 end
 
@@ -380,9 +406,9 @@ end
 --- @return boolean
 --- @private
 function PrayerFlicker:_projectileExists(id, range)
-    Utils:log(string.format("Scanning for projectiles (ID: %s, range: %d)", tostring(id), range or 60), "debug") -- DEBUG
+    dbg(string.format("Scanning for projectiles (ID: %s, range: %d)", tostring(id), range or 60)) -- DEBUG
     local found = #Utils:findAll(id, 5, range or 60) > 0
-    Utils:log(string.format("Projectiles found: %s", tostring(found)), "debug")                                  -- DEBUG
+    dbg(string.format("Projectiles found: %s", tostring(found)))                                  -- DEBUG
     return found
 end
 
@@ -401,14 +427,14 @@ function PrayerFlicker:_animationExists(npcId, animId, range)
             if npc.Id then
                 for _, anim in ipairs(animId) do
                     if npc.Anim == anim then
-                        Utils:log("Animation found on NPC", "debug") -- DEBUG
+                        dbg("Animation found on NPC") -- DEBUG
                         return true
                     end
                 end
             end
         end
     end
-    Utils:log("Animation not found", "debug") -- DEBUG
+    dbg("Animation not found") -- DEBUG
     return false
 end
 
@@ -417,9 +443,9 @@ end
 --- @return boolean
 --- @private
 function PrayerFlicker:_conditionalThreatExists(condition)
-    Utils:log("Evaluating conditional threat", "debug")          -- DEBUG
+    dbg("Evaluating conditional threat")          -- DEBUG
     local result = condition and condition()
-    Utils:log("Condition result: " .. tostring(result), "debug") -- DEBUG
+    dbg("Condition result: " .. tostring(result)) -- DEBUG
     return result
 end
 
@@ -429,14 +455,14 @@ end
 --- @return boolean: True if threat already exists, false otherwise
 --- @private
 function PrayerFlicker:_isThreatInTable(tableToCheck, threat)
-    Utils:log(string.format("Checking if threat exists in table: %s", threat.name or "Unnamed"), "debug") -- DEBUG
+    dbg(string.format("Checking if threat exists in table: %s", threat.name or "Unnamed")) -- DEBUG
     -- Handle pendingActions special case
     local items = tableToCheck
     if tableToCheck == self.pendingActions then
         -- Process pendingActions differently since threats are nested in action.threat
         for _, action in ipairs(tableToCheck) do
             if self:_threatsMatch(action.threat, threat) then
-                Utils:log("Threat already in pending actions", "debug") -- DEBUG
+                dbg("Threat already in pending actions") -- DEBUG
                 return true
             end
         end
@@ -444,12 +470,12 @@ function PrayerFlicker:_isThreatInTable(tableToCheck, threat)
         -- Standard table processing
         for _, existingThreat in ipairs(tableToCheck) do
             if self:_threatsMatch(existingThreat, threat) then
-                Utils:log("Threat already exists in table", "debug") -- DEBUG
+                dbg("Threat already exists in table") -- DEBUG
                 return true
             end
         end
     end
-    Utils:log("Threat not found in table", "debug") -- DEBUG
+    dbg("Threat not found in table") -- DEBUG
     return false
 end
 
@@ -459,11 +485,11 @@ end
 --- @return boolean: True if threats match
 --- @private
 function PrayerFlicker:_threatsMatch(threatA, threatB)
-    Utils:log(string.format("Comparing threats: %s vs %s", threatA.name or "A", threatB.name or "B"), "debug") -- DEBUG
+    dbg(string.format("Comparing threats: %s vs %s", threatA.name or "A", threatB.name or "B")) -- DEBUG
     -- Simple check if names exist and match
     if threatA.name and threatB.name then
         if threatA.name == threatB.name then
-            Utils:log("Threat names match", "debug") -- DEBUG
+            dbg("Threat names match") -- DEBUG
             return true
         end
     end
@@ -472,20 +498,20 @@ function PrayerFlicker:_threatsMatch(threatA, threatB)
     if threatA.type == threatB.type then
         if threatA.type == "Projectile" then
             local match = threatA.id == threatB.id
-            Utils:log(string.format("Projectile ID match: %s", tostring(match)), "debug") -- DEBUG
+            dbg(string.format("Projectile ID match: %s", tostring(match))) -- DEBUG
             return match
         elseif threatA.type == "Animation" then
             local match = (threatA.npcId == threatB.npcId) and (threatA.id == threatB.id)
-            Utils:log(string.format("Animation NPC/ID match: %s", tostring(match)), "debug") -- DEBUG
+            dbg(string.format("Animation NPC/ID match: %s", tostring(match))) -- DEBUG
             return match
         elseif threatA.type == "Conditional" then
             local match = tostring(threatA.condition) == tostring(threatB.condition)
-            Utils:log(string.format("Conditional function match: %s", tostring(match)), "debug") -- DEBUG
+            dbg(string.format("Conditional function match: %s", tostring(match))) -- DEBUG
             return match
         end
     end
 
-    Utils:log("Threats do not match", "debug") -- DEBUG
+    dbg("Threats do not match") -- DEBUG
     return false
 end
 
@@ -497,7 +523,7 @@ end
 --- @return Prayer: The prayer with the highest threat priority
 --- @private
 function PrayerFlicker:_determinePrayer()
-    Utils:log("Determining prayer based on threats...", "debug") -- DEBUG
+    dbg("Determining prayer based on threats...") -- DEBUG
     local currentTick = API.Get_tick()
     local actions     = self.pendingActions
 
@@ -507,16 +533,16 @@ function PrayerFlicker:_determinePrayer()
     end)
 
     if #actions > 0 then
-        Utils:log("Evaluating " .. #actions .. " actions", "debug") -- DEBUG
+        dbg("Evaluating " .. #actions .. " actions") -- DEBUG
         for _, action in ipairs(actions) do
             if currentTick - action.activationData.tickAdded >= action.threat.delay then
-                Utils:log("Selected prayer: " .. action.threat.prayer.name, "debug") -- DEBUG
+                dbg("Selected prayer: " .. action.threat.prayer.name) -- DEBUG
                 return action.threat.prayer
             end
         end
     end
 
-    Utils:log("No active threats, using default prayer", "debug") -- DEBUG
+    dbg("No active threats, using default prayer") -- DEBUG
     return self.defaultPrayer
 end
 
@@ -525,13 +551,13 @@ end
 --- @return boolean
 --- @private
 function PrayerFlicker:_switchPrayer(prayer)
-    Utils:log("Attempting to switch prayer...", "debug") -- DEBUG
+    dbg("Attempting to switch prayer...") -- DEBUG
     if not prayer then
-        Utils:log("No prayer provided", "debug")         -- DEBUG
+        dbg("No prayer provided")         -- DEBUG
         return false
     end
     if not self:_shouldToggle(prayer) then
-        Utils:log("Prayer toggle not required", "debug") -- DEBUG
+        dbg("Prayer toggle not required") -- DEBUG
         return false
     end
 
@@ -556,15 +582,15 @@ end
 --- Returns the active overhead used by the player
 --- @return Prayer
 function PrayerFlicker:_getActivePrayer()
-    Utils:log("Checking active prayer...", "debug") -- DEBUG
+    dbg("Checking active prayer...") -- DEBUG
     -- Loops through required prayers
     for _, prayer in ipairs(self.prayers) do
         if Player:getBuff(prayer.id).found then
-            Utils:log("Active prayer found: " .. prayer.name, "debug") -- DEBUG
+            dbg("Active prayer found: " .. prayer.name) -- DEBUG
             return prayer
         end
     end
-    Utils:log("No active prayer detected", "debug") -- DEBUG
+    dbg("No active prayer detected") -- DEBUG
     return {}
 end
 
@@ -573,20 +599,32 @@ end
 --- @return boolean: Whether the prayer should be toggled
 function PrayerFlicker:_shouldToggle(prayer)
     local currentTick = API.Get_tick()
-    local flickInterval = (prayer.name == self.state.activePrayer.name) and self.sameFlickInterval or
-    self.sameFlickInterval
+    -- SAME prayer re-flick waits sameFlickInterval; a DIFFERENT prayer waits the
+    -- short flickInterval.
+    --
+    -- Both arms of this used to read self.sameFlickInterval, which made the
+    -- ternary decide nothing and left self.flickInterval assigned at construction
+    -- and never read anywhere in the file. The effect was that swapping to a
+    -- different deflect — the entire point of flicking — was gated behind the
+    -- 4 tick same-prayer cooldown instead of 1, so a new incoming style could not
+    -- be answered for ~3 seconds after the previous activation. That is the
+    -- "prayer flicking is really behind" symptom, and no amount of loop speed
+    -- could fix it: the guard below rejects the switch regardless of how often
+    -- we ask.
+    local flickInterval = (prayer.name == self.state.activePrayer.name) and
+                              self.sameFlickInterval or self.flickInterval
 
-    Utils:log(string.format("Checking toggle conditions: CurrentTick=%d, LastActivation=%d, Interval=%d",
-        currentTick, self.state.activationTick, flickInterval), "debug") -- DEBUG
+    dbg(string.format("Checking toggle conditions: CurrentTick=%d, LastActivation=%d, Interval=%d",
+                      currentTick, self.state.activationTick, flickInterval))
 
     if currentTick - self.state.activationTick > flickInterval then
         local activePrayer = self:_getActivePrayer()
         local shouldToggle = prayer.name ~= (activePrayer and activePrayer.name or "")
-        Utils:log("Should toggle: " .. tostring(shouldToggle), "debug") -- DEBUG
+        dbg("Should toggle: " .. tostring(shouldToggle)) -- DEBUG
         return shouldToggle
     end
 
-    Utils:log("Toggle blocked by cooldown", "debug") -- DEBUG
+    dbg("Toggle blocked by cooldown") -- DEBUG
     return false
 end
 

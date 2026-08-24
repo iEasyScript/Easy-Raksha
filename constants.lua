@@ -7,7 +7,7 @@
 --- if a value is not in this file, the code must not assume it.
 ---@diagnostic disable: undefined-global
 
-local PrayerFlicker = require("core.prayer_flicker")
+local PrayerFlicker = require("raksha.core.prayer_flicker")
 
 local Constants = {}
 
@@ -96,7 +96,7 @@ Constants.INSTAKILL = {
     id = 2789,
     type = 4,
     lethalRange = 4, -- die within this many tiles
-    triggerRange = 5, -- start dodging when a highlight is this close
+    triggerRange = 4, -- start dodging when a highlight is this close
     safeRange = 6 -- move to a tile at least this far from every highlight
 }
 
@@ -353,7 +353,7 @@ Constants.ADDS = {
         -- reaches it and STOP as soon as we are back at or under it, rather than
         -- killing every pool. A siphon overrides both — once announced, all of
         -- them go.
-        killThreshold = 10,
+        killThreshold = 2,
 
         -- THE PHASE 3 POOL WINDOW: start below `startBelowHpInPhase3`, stop
         -- below `skipBelowHpInPhase3`. Outside it we are on Raksha.
@@ -698,7 +698,7 @@ Constants.MECHANICS = {
         -- presence-based and runs regardless of this animation.
         behaviour = "dodgeBombs",
         hazard = "BOMB_HAZARD",
-        escapeDistance = 5, -- tiles clear of a bomb's tile (covers the 2x2 + margin)
+        escapeDistance = 8, -- tiles clear of a bomb's tile (covers the 2x2 + margin)
 
         -- Re-issue the walk every 3 ticks, not every 1. A walk order takes
         -- several ticks to actually arrive, and re-issuing one each tick

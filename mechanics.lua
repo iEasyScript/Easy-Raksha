@@ -14,10 +14,10 @@
 ---@diagnostic disable: undefined-global
 
 local API       = require("api")
-local Utils     = require("core.helper")
-local Player    = require("core.player")
+local Utils     = require("raksha.core.helper")
+local Player    = require("raksha.core.player")
 local Constants = require("raksha.constants")
-local Profiler  = require("core.profiler")
+local Profiler  = require("raksha.core.profiler")
 
 local Mechanics = {}
 Mechanics.__index = Mechanics

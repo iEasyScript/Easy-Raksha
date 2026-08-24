@@ -4,8 +4,8 @@
 -- # IMPORTS
 ------------------------------------------
 local API = require("api")
-local Player = require("core.player")
-local Utils = require("core.helper")
+local Player = require("raksha.core.player")
+local Utils = require("raksha.core.helper")
 
 ------------------------------------------
 -- # TYPE DEFINITIONS
@@ -1440,9 +1440,18 @@ function WarsRetreat:_validatePresetItems()
         end
     end
 
+    -- Each warning by NAME, not just a count. A missing preset item is the one
+    -- thing that pins the step machine on LOAD PRESET indefinitely — the
+    -- inventory can never match, so we bank, re-check, bank again — and "1
+    -- warning(s)" tells you that happened without telling you what to fix. The
+    -- names are already built above; printing them costs nothing and turns a
+    -- dead end into a one-line diagnosis.
+    for _, msg in ipairs(self.warnings) do Utils:log(msg, "warn") end
+
     if #self.warnings > 0 then
-        Utils:log("Preset validation: " .. #self.warnings .. " warning(s)",
-                  "warn")
+        Utils:log("Preset validation: " .. #self.warnings ..
+                      " warning(s) — the inventory cannot match the preset " ..
+                      "until these are in it", "warn")
     end
 end
 

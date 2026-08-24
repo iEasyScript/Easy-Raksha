@@ -69,17 +69,24 @@ end
 --- Logs messages with different severity levels
 --- @param message string
 --- @param logType? "warn"|"error"|"debug"|"info"|"lua"
-function Utils:log(message, logType)
-    local debugLogTypes = {
-        warn = API.logWarn,
-        error = API.logError,
-        debug = API.logDebug,
-        info = API.logInfo,
-        lua = print
-    }
+--- Log level -> writer. Built ONCE.
+---
+--- This table used to be constructed inside Utils:log, so every call allocated a
+--- five-entry table and five field writes before logging anything. Utils:log is
+--- the most-called function in this codebase — core/prayer_flicker.lua alone
+--- reached it dozens of times per main-loop pass, at 10-20 passes a game tick —
+--- so that allocation was pure garbage-collector pressure in the hottest path a
+--- boss script has.
+local LOG_WRITERS = {
+    warn = API.logWarn,
+    error = API.logError,
+    debug = API.logDebug,
+    info = API.logInfo,
+    lua = print
+}
 
-    logType = logType or "debug"
-    local logFunction = debugLogTypes[logType] or debugLogTypes.debug
+function Utils:log(message, logType)
+    local logFunction = LOG_WRITERS[logType or "debug"] or LOG_WRITERS.debug
     logFunction(message)
 end
 
@@ -121,10 +128,25 @@ function Utils:canUseAbility(abilityName)
     return ability.enabled and (ability.cooldown_timer <= 1) and (ability.slot > 0)
 end
 
---- Uses ability from ability bar
+--- Uses ability from ability bar, but never one that is not ready.
+---
+--- Gated on canUseAbility above. It used to fire unconditionally, so every call
+--- site had to remember to check first — and most did not. Of the two dozen
+--- useAbility calls across raksha, only a handful were paired with a
+--- canUseAbility, and the rest spent their global cooldown clicking abilities
+--- that were still cooling down.
+---
+--- Putting the check HERE fixes every call site at once, and the ones that do
+--- already check simply ask twice, which costs nothing.
+---
+--- canUseAbility carries the per-ability special cases with it: Volley of Souls
+--- is judged on stacks rather than cooldown, and Death Skulls on cooldown rather
+--- than `enabled`. Those exceptions exist because the generic test is wrong for
+--- them, and routing through it is what keeps them applying.
 --- @param abilityName string
 --- @return boolean
 function Utils:useAbility(abilityName)
+    if not self:canUseAbility(abilityName) then return false end
     return API.DoAction_Ability(abilityName, 1, API.OFF_ACT_GeneralInterface_route, true)
 end
 
@@ -309,11 +331,25 @@ function Utils:formatNumber(number)
 end
 
 function Utils:getLootWindowAmount()
-    local text = API.ScanForInterfaceTest2Get(false,
     ---@diagnostic disable-next-line
-        { { 1622, 4, -1, 0 }, { 1622, 6, -1, 0 }, { 1622, 2, -1, 0 }, { 1622, 3, -1, 0 } })
-    if text and #text > 0 and text[1].textids then
-        local value = string.match(text[1].textids, "Value: <col=[0-9A-F]+>([%d,]+[KMB]?)") -- matches numbers with commas and optional M/B suffix, with any color code
+    local okText, text = pcall(API.ScanForInterfaceTest2GetAll,
+        { { 1622, 4, -1, 0 }, { 1622, 6, -1, 0 }, { 1622, 2, -1, 0 }, { 1622, 3, -1, 0 } }, false)
+    if not okText then return 0 end
+    -- Search every row for the Value line instead of assuming row 1 carries it.
+    -- ScanForInterfaceTest2GetAll returns one row per component, so which row
+    -- holds the text depends on the window's layout rather than on the order
+    -- these ids happen to be listed in.
+    local matched = nil
+    if type(text) == "table" then
+        for _, row in ipairs(text) do
+            if row and type(row.textids) == "string" then
+                matched = string.match(row.textids, "Value: <col=[0-9A-F]+>([%d,]+[KMB]?)")
+                if matched then break end
+            end
+        end
+    end
+    if text and #text > 0 then
+        local value = matched -- matches numbers with commas and optional M/B suffix, with any color code
         if value then
             value = string.gsub(value, ",", "")                                             -- remove commas before converting to number
             value = string.gsub(value, "K", "000")                                          -- convert K to 000
@@ -385,15 +421,55 @@ end
 ------------------------------------------
 
 --- Checks for active boss instance timer
+---
+--- Interface-based and BOOLEAN ONLY — it answers "is a timer on screen", not how
+--- long is left. For the remaining minutes use the calling script's own
+--- instanceMinutesLeft, which reads the game's own expiry varbit.
 --- @return boolean
 function Utils:bossTimerExists()
+    -- Ask whether interface 861 is DRAWN before trying to read text out of it.
+    --
+    -- The component-path scan below is no longer dependable: the API update
+    -- unpacks slot 4 of each tuple into InterfaceComp5's memloc, so the old
+    -- parent-linked chain form makes the native throw, and the parent-free
+    -- rewrite stops matching the timer text. One interface id has no path to get
+    -- wrong, and it is how the instance panel and enrage checks already ask.
+    if API.GetInterfaceOpenBySize(861) then return true end
+
     local instanceTimer = {
-        { 861, 0, -1, -1, 0 }, { 861, 2, -1, 0, 0 },
-        { 861, 4, -1, 2,  0 }, { 861, 8, -1, 4, 0 }
+        { 861, 0, -1, 0 }, { 861, 2, -1, 0 },
+        { 861, 4, -1, 0 }, { 861, 8, -1, 0 }
     }
-    local result = API.ScanForInterfaceTest2Get(false, instanceTimer)
-    return result and #result > 0 and #result[1].textids > 0
+    local ok, result = pcall(API.ScanForInterfaceTest2GetAll, instanceTimer, false)
+    if not ok or type(result) ~= "table" then return false end
+    -- Any row with text: the list is a chain, and ScanForInterfaceTest2GetAll
+    -- returns one row per entry rather than resolving to the leaf, so row 1 is
+    -- the root container and no longer the timer text.
+    for _, row in ipairs(result) do
+        if row and type(row.textids) == "string" and #row.textids > 0 then
+            return true
+        end
+    end
+    return false
 end
+
+------------------------------------------
+--# BOSS INSTANCE TIMER
+------------------------------------------
+
+--- The instance expiry varbit and the read that turns it into minutes are
+--- deliberately NOT here.
+---
+--- They used to be — Utils.INSTANCE_EXPIRY_VARBIT and Utils:instanceMinutesLeft
+--- — on the grounds that every War's Retreat boss reads the same number, so one
+--- copy could not drift from another. That is the wrong trade: the reading
+--- belongs to the script that owns the instance, and a shared static gives every
+--- script that requires this module a handle on someone else's instance state.
+---
+--- So each script keeps its own private varbit id and its own isInstanceValid /
+--- instanceMinutesLeft. See rasial/main.lua, raksha/main.lua,
+--- kerapac/KerapacPreparation.lua and GateOfElid.lua for the shape. If you
+--- change the conversion in one, the others do not follow — that is the point.
 
 ------------------------------------------
 --# UI & DATA FORMATTING

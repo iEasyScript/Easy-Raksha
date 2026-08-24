@@ -5,14 +5,14 @@
 
 local API             = require("api")
 
-local RotationManager = require("core.rotation_manager")
-local PlayerManager   = require("core.player_manager")
-local PrayerFlicker   = require("core.prayer_flicker")
-local WarsRetreat     = require("core.wars_retreat")
-local Player          = require("core.player")
-local Utils           = require("core.helper")
-local Timer           = require("core.timer")
-local Profiler        = require("core.profiler")
+local RotationManager = require("raksha.core.rotation_manager")
+local PlayerManager   = require("raksha.core.player_manager")
+local PrayerFlicker   = require("raksha.core.prayer_flicker")
+local WarsRetreat     = require("raksha.core.wars_retreat")
+local Player          = require("raksha.core.player")
+local Utils           = require("raksha.core.helper")
+local Timer           = require("raksha.core.timer")
+local Profiler        = require("raksha.core.profiler")
 
 local Constants       = require("raksha.constants")
 local Mechanics       = require("raksha.mechanics")
@@ -1177,6 +1177,54 @@ local function summonConjures()
 end
 
 ------------------------------------------
+-- # LOBBY PRE-FIGHT SEQUENCE
+------------------------------------------
+
+-- Conjure Undead Army -> Life Transfer -> one food -> enter the instance.
+--
+-- Life Transfer heals the conjures at the cost of OUR health, which is the whole
+-- reason the food follows it rather than precedes it: eating first just tops up
+-- health we are about to spend. Doing both in the lobby means we walk through
+-- the gate with the conjures already healthy and our own health back up, instead
+-- of paying for it on Raksha's clock.
+local LIFE_TRANSFER_ABILITY = "Life Transfer"
+
+-- Ticks allowed for the whole lobby sequence before we go in without it.
+--
+-- On top of CONJURE_WAIT_TICKS rather than replacing it: that constant covers
+-- the summon landing, and these two steps come after it. Life Transfer can be on
+-- cooldown from the previous kill and the food can simply be absent, so neither
+-- step is allowed to hold the trip up indefinitely — the existing "go anyway"
+-- escape in the Handle instance condition still owns that decision, this just
+-- widens its window to fit the extra steps.
+local LOBBY_PREP_WAIT_TICKS = CONJURE_WAIT_TICKS + 10
+
+--- The first food in the bag, or nil when there is none.
+---
+--- Reads the player manager's own categorised inventory rather than scanning
+--- again: _processInventory already classifies every health item and refreshes
+--- every 5 ticks from the main loop, so the list is current in the lobby.
+--- @return table|nil
+local function lobbyFoodItem()
+    local food = playerManager.inventory and playerManager.inventory.food
+    if not food or #food == 0 then return nil end
+    return food[1]
+end
+
+--- Eats one food from the ACTION BAR.
+---
+--- useBarItem, not Inventory:DoAction — see the note above useBarItem: every
+--- item this script activates goes through the bar, and the inventory calls are
+--- deliberately gone from this file. The food therefore has to be barred; if it
+--- is not, useBarItem says so once and loudly rather than failing silently.
+--- @return boolean ate
+local function eatOneFood()
+    local item = lobbyFoodItem()
+    if not item or not item.name then return false end
+    return useBarItem(item.name)
+end
+
+------------------------------------------
 -- # SPECIAL ATTACK GATING
 ------------------------------------------
 
@@ -1506,7 +1554,6 @@ local FIGHT_ROTATION = {
     -- full 3. Death Skulls (4) needs longer than the GCD.
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Darkness", wait = 2, useTicks = true},
-    {label = "Life Transfer", wait = 2, useTicks = true},
     {label = "Vengeance", wait = 1, useTicks = true},
     {label = "Invoke Lord of Bones", wait = 2, useTicks = true},
     {label = "Surge", wait = 3, useTicks = true},
@@ -1531,7 +1578,7 @@ local FIGHT_ROTATION = {
             ---@diagnostic disable-next-line: undefined-global
             --return API.DoAction_WalkerW(WPOINT.new(hx, hy, hz))
         end,
-        wait = 2,
+        wait = 0,
         useTicks = true
     },
 
@@ -1557,7 +1604,7 @@ local FIGHT_ROTATION = {
         -- bag. Thrown from the action bar instead, like every other item here.
         type = "Custom",
         action = function() return useBarItem("Vulnerability bomb") end,
-        wait = 1,
+        wait = 0,
         useTicks = true,
         setupBoundary = true
     },
@@ -1656,7 +1703,7 @@ local PHASE3_ROTATION = {
         -- bag. Thrown from the action bar instead, like every other item here.
         type = "Custom",
         action = function() return useBarItem("Vulnerability bomb") end,
-        wait = 1,
+        wait = 0,
         useTicks = true,
         setupBoundary = true
     },
@@ -1801,7 +1848,7 @@ local PHASE4_ROTATION = {
         -- bag. Thrown from the action bar instead, like every other item here.
         type = "Custom",
         action = function() return useBarItem("Vulnerability bomb") end,
-        wait = 1,
+        wait = 0,
         useTicks = true,
         setupBoundary = true
     },
@@ -2049,6 +2096,61 @@ local KILL_TRUST_HP = 20000
 -- which is far longer than a Loot All needs.
 local LOOT_TIMEOUT_TICKS = 50
 
+--- The loot window, and the component that takes everything in it.
+---
+--- MEASURED, supplied from the interface inspector. Both of the opaque natives
+--- this used to rely on — API.LootWindowOpen_2 and API.DoAction_LootAll_Button
+--- — stopped answering, and the failure mode was ugly: the window check read
+--- false while the window was plainly on screen, so pickUpLoot fell through to
+--- the ground-item branch and clicked the pile over and over (the
+--- "DoAction_G_Item: 48076" spam — 48076 is Dinosaur bones (noted), a common
+--- off the drop table).
+---
+--- Component 21 is the one the working action routes through. The inspector also
+--- shows the button itself at 1622:15; the two are not necessarily the same
+--- thing, and 21 is what the DoAction below was verified with.
+local LOOT_INTERFACE = 1622
+local LOOT_ALL_COMPONENT = 21
+
+--- Components on 1622 known to carry text while the window is up.
+---
+--- The same four core/helper.lua reads the "Value:" line off in
+--- getLootWindowAmount, so if any of them is holding text the window is open.
+local LOOT_WINDOW_TEXT = {
+    {LOOT_INTERFACE, 4, -1, 0}, {LOOT_INTERFACE, 6, -1, 0},
+    {LOOT_INTERFACE, 2, -1, 0}, {LOOT_INTERFACE, 3, -1, 0}
+}
+
+--- True while the loot window is on screen.
+---
+--- Two signals, because neither is trustworthy alone. GetInterfaceOpenBySize is
+--- the documented way to test a window with no varbit, but Arch-Glacor already
+--- caught it reporting closed on a window that was visibly up
+--- (Arch-Glacor/AG/config.lua, chestInterfaceOpen), so a text scan backs it up.
+--- Answering "open" too eagerly is the safe direction here: the worst case is we
+--- press Loot All at nothing, where the old failure clicked the ground pile a
+--- dozen times a tick.
+--- @return boolean
+local function lootWindowOpen()
+    if API.GetInterfaceOpenBySize(LOOT_INTERFACE) then return true end
+
+    local ok, rows = pcall(API.ScanForInterfaceTest2GetAll, LOOT_WINDOW_TEXT,
+                           false)
+    if not ok or type(rows) ~= "table" then return false end
+
+    for _, row in ipairs(rows) do
+        if row then
+            local ids = row.textids
+            local item = row.textitem
+            if (type(ids) == "string" and #ids > 0) or
+                (type(item) == "string" and #item > 0) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local RakshaFight = {
     variables = {
         engaged = false, -- Rotation loaded and fight underway
@@ -2056,6 +2158,9 @@ local RakshaFight = {
         looted = false,
         lootDeadline = 0, -- tick we give up looting and teleport out regardless
         lootTimeoutLogged = false,
+        -- Tick the ground pile was last clicked, so opening the window is paced
+        -- to once per game tick no matter how often the task runs.
+        lastLootClickTick = -1,
         bossSeen = false, -- Latched once Raksha has been detected this trip
         sawBossAlive = false, -- Latched once Raksha is seen with health > 0
         deadStreak = 0, -- Consecutive GAME TICKS the boss has looked dead/absent
@@ -2351,6 +2456,11 @@ local RakshaLobby = {
         -- alive. It is what separates the dialogue that is part of the create
         -- flow from the one that means "you already have an instance".
         startConfirmed = false,
+        -- Lobby pre-fight sequence latches: Conjure -> Life Transfer -> food.
+        -- Cleared the moment we are no longer at the lobby (see the Handle
+        -- instance condition) so each trip runs the sequence fresh.
+        lifeTransferDone = false,
+        foodEaten = false,
         rejoinAttempts = 0, -- consecutive rejoin tries this trip
         lastInstanceAttempt = 0, -- os.clock() of the pending new-instance attempt
         instanceAttemptCount = 0, -- consecutive new-instance timeouts
@@ -2753,6 +2863,7 @@ function RakshaFight:reset()
     self.variables.bossDead = false
     self.variables.looted = false
     self.variables.lootRecorded = false
+    self.variables.lastLootClickTick = -1
     -- Dropped rather than carried. A staged kill still sitting here means its
     -- pile never materialised — loot timed out, or the detector fired on a bad
     -- scan — and carrying it would hand its duration to the NEXT kill.
@@ -2766,6 +2877,11 @@ function RakshaFight:reset()
     self.variables.lastKnownHealth = -1
     self.variables.deadStreakWarned = false
     self.variables.conjured = false
+    -- The lobby sequence latches live on RakshaLobby, but a trip reset has to
+    -- clear them too: reset() runs on the teleport home, where the Handle
+    -- instance condition may not get another pass at the lobby branch first.
+    RakshaLobby.variables.lifeTransferDone = false
+    RakshaLobby.variables.foodEaten = false
     self.variables.luckEquipped = false
     self.variables.loadedPhase = 1
     self.variables.specialActionClicks = 0
@@ -2859,10 +2975,27 @@ function RakshaFight:pickUpLoot()
     local hasLoot = #self:getGroundLoot() > 0
     if not hasLoot then return false end
 
-    if not API.LootWindowOpen_2() then
-        return API.DoAction_G_Items1(0x45,
-                                     Utils:virtualTableConcat(LOOT.COMMONS,
-                                                              LOOT.UNIQUES), 30)
+    if not lootWindowOpen() then
+        -- ONE click per game tick, and report the attempt as an action taken.
+        --
+        -- Both halves matter. Timer:_execute only stamps a task's cooldown when
+        -- the action returns TRUE (core/timer.lua:397), so the old
+        -- `return API.DoAction_G_Items1(...)` re-ran this whole branch on every
+        -- loop pass whenever the click reported false — 10-20 ground-item
+        -- clicks per game tick at the pile. Returning true hands the task its 1
+        -- tick cooldown; the explicit tick guard makes the pacing independent of
+        -- that, since this path has already proven it can spam.
+        --
+        -- Opening the window is not the same as having looted, so `looted` is
+        -- deliberately NOT set here — the Loot All press below owns that.
+        local tick = API.Get_tick()
+        if tick == self.variables.lastLootClickTick then return false end
+        self.variables.lastLootClickTick = tick
+
+        API.DoAction_G_Items1(0x45,
+                              Utils:virtualTableConcat(LOOT.COMMONS,
+                                                       LOOT.UNIQUES), 30)
+        return true
     end
 
     -- Record BEFORE taking it. Both sources only exist right now: the window's
@@ -2880,7 +3013,12 @@ function RakshaFight:pickUpLoot()
     local uniques = (not self.variables.lootRecorded) and
                         Utils:findAll(LOOT.UNIQUES, 3, 30) or nil
 
-    if API.DoAction_LootAll_Button() then
+    -- Loot All by interface component rather than API.DoAction_LootAll_Button,
+    -- which is an opaque native and was not landing.
+    ---@diagnostic disable-next-line: missing-parameter
+    if API.DoAction_Interface(0x24, 0xffffffff, 1, LOOT_INTERFACE,
+                              LOOT_ALL_COMPONENT, -1,
+                              API.OFF_ACT_GeneralInterface_route) then
         if not self.variables.lootRecorded then
             self.variables.lootRecorded = true
             -- First, so the pile and any rare are stamped with this kill's
@@ -3375,7 +3513,59 @@ RakshaFight.tasks = {
             return false
         end
     }, {
-        -- Lobby step 2: start the instance (rejoin or create), but only once the
+        -- Lobby step 2: Life Transfer into the conjures we just summoned.
+        --
+        -- Gated on hasActiveConjures rather than on having CLICKED the summon:
+        -- transferring before they exist heals nothing and spends our health for
+        -- it. `conjuring()` keeps us off the cast while the summon animation is
+        -- still playing, the same guard the instance step uses.
+        name = "Lobby: Life Transfer",
+        priority = 59,
+        cooldown = 3,
+        useTicks = true,
+        parallel = true,
+        condition = function()
+            if not RakshaLobby:atLocation() then return false end
+            if RakshaLobby.variables.lifeTransferDone then return false end
+            if conjuring() then return false end
+            if not hasActiveConjures() then return false end
+            return Utils:canUseAbility(LIFE_TRANSFER_ABILITY)
+        end,
+        action = function()
+            if Utils:useAbility(LIFE_TRANSFER_ABILITY) then
+                RakshaLobby.variables.lifeTransferDone = true
+                Utils:log("Life Transfer cast into the conjures")
+                return true
+            end
+            return false
+        end
+    }, {
+        -- Lobby step 3: put back the health Life Transfer just spent.
+        --
+        -- Strictly AFTER the transfer, which is the entire point of the
+        -- ordering: eating first tops up health we are about to give away.
+        name = "Lobby: eating before entry",
+        priority = 58,
+        cooldown = 3,
+        useTicks = true,
+        parallel = true,
+        condition = function()
+            if not RakshaLobby:atLocation() then return false end
+            if RakshaLobby.variables.foodEaten then return false end
+            if conjuring() then return false end
+            if not RakshaLobby.variables.lifeTransferDone then return false end
+            return lobbyFoodItem() ~= nil
+        end,
+        action = function()
+            if eatOneFood() then
+                RakshaLobby.variables.foodEaten = true
+                Utils:log("Ate one food after Life Transfer")
+                return true
+            end
+            return false
+        end
+    }, {
+        -- Lobby step 4: start the instance (rejoin or create), but only once the
         -- conjures are genuinely up. Entering on the click flag cut the summon
         -- animation short, so we never actually got conjures.
         name = "Handle instance",
@@ -3386,6 +3576,11 @@ RakshaFight.tasks = {
             if not RakshaLobby:atLocation() then
                 -- Reset the lobby timer as we leave, ready for the next trip.
                 RakshaLobby.variables.lobbyEnteredTick = nil
+                -- And the pre-fight latches with it, so the next trip conjures,
+                -- transfers and eats again rather than walking straight in on
+                -- last trip's flags.
+                RakshaLobby.variables.lifeTransferDone = false
+                RakshaLobby.variables.foodEaten = false
                 return false
             end
 
@@ -3395,12 +3590,21 @@ RakshaFight.tasks = {
                 RakshaLobby.variables.lobbyEnteredTick or API.Get_tick()
 
             if conjuring() then return false end -- never interrupt the summon
-            if hasActiveConjures() then return true end
 
-            -- No conjures yet: give the summon a fair window to land, then go
-            -- anyway rather than stalling in the lobby forever.
+            -- The full sequence: conjures OUT, Life Transfer spent, one food
+            -- eaten. Only then do we go through the gate.
+            if hasActiveConjures() and RakshaLobby.variables.lifeTransferDone and
+                RakshaLobby.variables.foodEaten then
+                return true
+            end
+
+            -- Escape hatch, and it now covers all three steps rather than just
+            -- the summon. Any of them can legitimately never complete — the
+            -- summon or Life Transfer on cooldown from the previous life, no food
+            -- in the bag, an unbarred item — and none of those is worth parking
+            -- the script in the lobby over. Go in with whatever we managed.
             return (API.Get_tick() - RakshaLobby.variables.lobbyEnteredTick) >
-                       CONJURE_WAIT_TICKS
+                       LOBBY_PREP_WAIT_TICKS
         end,
         action = function() return RakshaLobby:handleInstance() end,
         delay = 1,

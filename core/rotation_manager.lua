@@ -4,8 +4,8 @@
 -- # IMPORTS
 ------------------------------------------
 local API = require("api")
-local Player = require("core.player")
-local Utils = require("core.helper")
+local Player = require("raksha.core.player")
+local Utils = require("raksha.core.helper")
 
 ------------------------------------------
 -- # TYPE DEFINITIONS

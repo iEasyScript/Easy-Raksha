@@ -10,7 +10,7 @@
 ---@diagnostic disable: undefined-global
 
 local API    = require("api")
-local GUILib = require("core.gui_lib")
+local GUILib = require("raksha.core.gui_lib")
 
 local RakshaGUI = {}
 
@@ -612,7 +612,7 @@ end
 --------------------------------------------------------------------------------
 
 local function drawWarsTaskOrderTab(cfg)
-    local WarsRetreat = require("core.wars_retreat")
+    local WarsRetreat = require("raksha.core.wars_retreat")
 
     ui:spacing(1)
     ui:sectionHeader("Task Execution Order",
