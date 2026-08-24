@@ -12,6 +12,7 @@ local WarsRetreat     = require("core.wars_retreat")
 local Player          = require("core.player")
 local Utils           = require("core.helper")
 local Timer           = require("core.timer")
+local Profiler        = require("core.profiler")
 
 local Constants       = require("raksha.constants")
 local Mechanics       = require("raksha.mechanics")
@@ -592,6 +593,18 @@ do
 end
 
 ClearRender()
+
+------------------------------------------
+-- # PASS PROFILER
+------------------------------------------
+
+--- Section timings for one main-loop pass. Lives in core/profiler.lua so
+--- mechanics.lua can time its own internals against the same table — the
+--- previous version was a local here, which meant the single most expensive
+--- call in the pass (Mechanics:update) could only ever be measured as one
+--- opaque number.
+local profMark = Profiler.mark
+local profileSnapshot = Profiler.snapshot
 
 local Common = {
     scriptStartTime = os.time(),
@@ -1932,23 +1945,66 @@ local SPECIAL_ACTION_BUFF = 12171
 local SPECIAL_ACTION_MAX_CLICKS = 3 -- hard cap per buff window
 local SPECIAL_ACTION_RETRY_TICKS = 2 -- pacing between retries
 
---- True while the special action button is still drawn on screen.
+--- The components scanned for the button's label. Built once: a fresh table per
+--- call would allocate on every check, and this runs inside the fight loop.
 --- Component 6 is the one Raksha's button is clicked through; 0 and 1 are
 --- included because that's where other bosses' buttons expose their label and
 --- the container layout isn't guaranteed to be identical.
+local SPECIAL_ACTION_COMPONENTS = {
+    {743, 0, -1, 0}, {743, 1, -1, 0}, {743, 6, -1, 0}
+}
+
+--- Last tick the scan actually ran, and what it answered.
+---
+--- clickSpecialAction is called unconditionally from the fight handler, which is
+--- `parallel` with `cooldown = 0` — so this runs 12-20 times per GAME TICK.
+--- While the call underneath was a nil-pcall that cost nothing. A real native
+--- scan of three components repeated that often is pure waste, since the button
+--- cannot appear and vanish within one tick. Mechanics:siphonImminent throttles
+--- its chat read exactly this way and for exactly this reason.
+local lastSpecialScanTick = -1
+local lastSpecialScanResult = false
+
+--- True while the special action button is still drawn on screen.
 --- @return boolean
 local function specialActionVisible()
-    -- Nested-table form: ScanForInterfaceTest2Get builds the InterfaceComp5
-    -- objects itself when handed plain tables, which is how every other caller
-    -- in this codebase uses it — so the missing-fields warning is spurious.
-    ---@diagnostic disable-next-line: missing-fields
-    local ok, found = pcall(API.ScanForInterfaceTest2Get, false,
-                            {{743, 0, -1, 0}, {743, 1, -1, 0}, {743, 6, -1, 0}})
+    local tick = API.Get_tick()
+    if tick == lastSpecialScanTick then return lastSpecialScanResult end
+    lastSpecialScanTick = tick
+    lastSpecialScanResult = false
+
+    -- API.ScanForInterfaceTest2Get IS GONE as of the interface API update, and
+    -- calling it here is why this scan never once returned true. It was not in
+    -- api.lua at all, so the pcall was catching "attempt to call a nil value"
+    -- every single check — which reads exactly like "the button was never on
+    -- screen", so specialActionScanWorks never latched and the click fell back
+    -- to buff 12171 forever. That is the fallback the comment above already
+    -- describes as unreliable.
+    --
+    -- ScanForInterfaceTest2GetAll is the replacement, and it is NOT a chain
+    -- scan: it hands back one row PER COMPONENT rather than resolving the list
+    -- down to a leaf. That suits this check unchanged — we only care whether
+    -- any of the three is carrying text — but it is why the row order can no
+    -- longer be assumed to match the order the ids are listed in.
+    local ok, found = pcall(API.ScanForInterfaceTest2GetAll,
+                            SPECIAL_ACTION_COMPONENTS, false)
     if not ok or type(found) ~= "table" then return false end
 
     for _, entry in ipairs(found) do
-        if entry and type(entry.textitem) == "string" and entry.textitem ~= "" then
-            return true
+        -- BOTH fields, textids first. The inspector reports these separately and
+        -- a cell can populate either: under the new API the label routinely
+        -- arrives on textids with textitem left empty, which core/helper.lua
+        -- (getLootWindowAmount, the instance-timer check) already reads for.
+        -- Checking only textitem — as this did — is a second way to read
+        -- nothing off a component that is perfectly correct.
+        if entry then
+            local ids = entry.textids
+            local item = entry.textitem
+            if (type(ids) == "string" and #ids > 0) or
+                (type(item) == "string" and #item > 0) then
+                lastSpecialScanResult = true
+                return true
+            end
         end
     end
     return false
@@ -2040,17 +2096,54 @@ function RakshaFight:atLocation()
     return API.InInstancedArea()
 end
 
+--- Per-GAME-TICK memo for the boss read. See getBoss.
+local fightBossCache, fightBossCacheTick = nil, -1
+
+--- Raksha's entity info.
+---
+--- MEMOISED PER GAME TICK for the same reason Mechanics:getBoss is: handleFight
+--- calls this at the top and is driven by the "Handle fight" task, which is
+--- `parallel` with `cooldown = 0` — 12-20 native NPC scans per tick for a value
+--- the game only updates on tick boundaries. buildGUIData calls it too, once per
+--- RENDERED FRAME, which added the client's whole frame rate on top.
+---
+--- This is a SEPARATE cache from the mechanics one because the two return
+--- different shapes (this one is Utils:getEntityInfo — health/animation/tile;
+--- the other is life/anim/x/y/z/distance). Sharing one read would mean reshaping
+--- at every call site, which is a bigger change than the delay warrants.
 --- @return table
 function RakshaFight:getBoss()
-    return Utils:getEntityInfo(Constants.BOSS.id, Constants.BOSS.type, 60)
+    local tick = API.Get_tick()
+    if fightBossCache and tick == fightBossCacheTick then
+        return fightBossCache
+    end
+
+    fightBossCacheTick = tick
+    fightBossCache = Utils:getEntityInfo(Constants.BOSS.id, Constants.BOSS.type,
+                                         60)
+    return fightBossCache
 end
+
+--- Per-GAME-TICK memo for the subdued-Raksha read. See subduedPresent.
+local subduedCache, subduedCacheTick = false, -1
 
 --- True once the subdued Raksha (27353) is on the floor — he's dead and the drop
 --- can be looted.
+---
+--- MEMOISED PER GAME TICK. This is read from the "Registering the kill" task
+--- CONDITION, and Timer:run evaluates every task's condition on every cycle
+--- (core/timer.lua:247) — not just the ones that could fire. The three gates
+--- ahead of it (atLocation, engaged, not bossDead) are all true for the whole
+--- fight, so this scan ran on every loop iteration from the pull to the kill.
 --- @return boolean
 function RakshaFight:subduedPresent()
+    local tick = API.Get_tick()
+    if tick == subduedCacheTick then return subduedCache end
+
     local sub = Constants.BOSS_SUBDUED
-    return #Utils:findAll(sub.id, sub.type, 60) > 0
+    subduedCacheTick = tick
+    subduedCache = #Utils:findAll(sub.id, sub.type, 60) > 0
+    return subduedCache
 end
 
 --- True while Raksha is playing the phase 4 transition.
@@ -2856,7 +2949,9 @@ end
 --- The per-tick fight driver.
 --- @return boolean
 function RakshaFight:handleFight()
+    local tProf = os.clock()
     local boss = self:getBoss()
+    tProf = profMark("fight:getBoss", tProf)
 
     if boss.found then self.variables.bossSeen = true end
 
@@ -3077,9 +3172,12 @@ function RakshaFight:handleFight()
         --
         -- Requesting costs nothing and takes no global cooldown; it only records
         -- intent, and playerManager:update() acts on it later in the same loop.
+        tProf = os.clock()
         playerManager:requestBuffs(BUFFS)
+        tProf = profMark("requestBuffs", tProf)
 
         prayerFlicker:update()
+        tProf = profMark("prayerFlicker", tProf)
 
         -- Phase 4 special action button, BEFORE the global-cooldown arbitration
         -- below and deliberately not part of it.
@@ -3091,15 +3189,18 @@ function RakshaFight:handleFight()
         -- global cooldown, so it has no business in that chain: it runs on its
         -- own pacing and lets the rotation carry on in the same tick.
         self:clickSpecialAction()
+        tProf = profMark("specialAction", tProf)
 
         -- Mechanics get first claim on the tick. When one consumes the action
         -- (a counter ability, an Escape, a Freedom/Surge step) the rotation
         -- must not also fire, or the two contend for the same global cooldown.
         local consumed = mechanics:update()
+        tProf = profMark("mechanics:update", tProf)
 
         -- Defensives come straight after the mechanic responses and ahead of
         -- everything else: staying alive beats both DPS and conjure upkeep.
         if not consumed and spendSurvivalAbilities() then consumed = true end
+        tProf = profMark("survival", tProf)
 
         -- Re-summon conjures if they've been killed or expired mid-fight. Sits
         -- here rather than in its own task so it shares the same global-cooldown
@@ -3131,12 +3232,15 @@ function RakshaFight:handleFight()
                 Utils:log("Rotation error: " .. tostring(err), "error")
             end
         end
+        profMark("rotation", tProf)
     else
         prayerFlicker:deactivatePrayer()
     end
 
+    local tTail = os.clock()
     playerManager:manageHealth()
     playerManager:managePrayer()
+    profMark("health/prayer", tTail)
 
     return true
 end
@@ -3989,6 +4093,106 @@ local function buildLootSnapshot()
     }
 end
 
+------------------------------------------
+-- # LOOP HEALTH
+------------------------------------------
+
+--- How many main-loop iterations happened in the last tick, and the largest tick
+--- JUMP seen between two consecutive iterations.
+---
+--- This exists to answer "are we behind the game?" with a number rather than a
+--- feeling. The loop is meant to run 12-20 times per 600ms game tick, and every
+--- per-tick memo in this script — and in core/rotation_manager — assumes it
+--- runs at least once per tick.
+---
+--- `jump` is the reading that matters. Between two consecutive iterations the
+--- tick counter should move by 0 (still the same tick) or 1 (we rolled into the
+--- next). A jump of 2 or more means one pass of the loop took longer than a
+--- whole game tick and we SKIPPED one: every mechanic that started and ended
+--- inside that tick was never seen, and the rotation's `wait` counted down
+--- against a tick we never observed. That is what being "ticks behind" is.
+local loopHealth = {itersThisTick = 0, itersLastTick = 0, lastJump = 0,
+                    worstJump = 0, skippedTicks = 0, lastTick = -1}
+
+--- Records one pass of the main loop. Costs a single Get_tick.
+local function noteLoopIteration()
+    local tick = API.Get_tick()
+
+    if loopHealth.lastTick < 0 then
+        loopHealth.lastTick = tick
+        loopHealth.itersThisTick = 1
+        return
+    end
+
+    local jump = tick - loopHealth.lastTick
+    if jump == 0 then
+        loopHealth.itersThisTick = loopHealth.itersThisTick + 1
+        return
+    end
+
+    -- Rolled into a new tick: publish the count for the tick that just ended.
+    loopHealth.itersLastTick = loopHealth.itersThisTick
+    loopHealth.itersThisTick = 1
+    loopHealth.lastTick = tick
+    loopHealth.lastJump = jump
+
+    if jump > loopHealth.worstJump then loopHealth.worstJump = jump end
+
+    -- A jump of 1 is normal. Beyond that is ticks we never looked at.
+    if jump > 1 then
+        loopHealth.skippedTicks = loopHealth.skippedTicks + (jump - 1)
+    end
+end
+
+--- Cached mechanics debug rows, and the clock reading they were built at.
+local trackingCache, trackingCacheAt = nil, -math.huge
+
+--- How often the mechanics debug readout may be rebuilt, in seconds.
+---
+--- It is a HUMAN-READABLE DIAGNOSTIC — nobody can read a table that updates 60
+--- times a second, so rebuilding it at the client's frame rate bought nothing
+--- and cost a great deal. Four times a second is still faster than the eye
+--- follows and is ~1/20th of the scanning.
+local TRACKING_INTERVAL = 0.25
+
+--- The mechanics debug rows, gated and throttled.
+---
+--- THIS WAS THE MAIN SOURCE OF THE DELAY. Mechanics:tracking() ends with a live
+--- "Detected:" block that runs five object scans — findAnyType for 2789, 27355,
+--- 27356 and 27354, plus getShadowTiles — and findAnyType asks for EIGHT object
+--- types at once (mechanics.lua:270), three of them at range 60. buildGUIData
+--- called it unconditionally on every RENDERED FRAME, on ImGui's thread. At 60
+--- fps that is ~300 native object-array scans a second, all of them competing
+--- with the fight loop for the same client, purely to fill a debug table.
+---
+--- Two gates now. The tab that displays these rows only exists when the
+--- mechanics debug flag is on (raksha/gui.lua:1154), so with it off the rows
+--- were being computed and then thrown away entirely — that path now does no
+--- work at all. With it on, the rebuild is throttled to TRACKING_INTERVAL and
+--- the last table is handed back in between.
+---
+--- CONFIG.debug.mechanics, NOT CONFIG.debugMechanics: getConfig() reshapes the
+--- flat GUI table into a nested runtime one (raksha/gui.lua:475-483), so the
+--- flat name the checkbox and the tab check use does not exist on CONFIG. Gating
+--- on the wrong name here would read nil and silently disable the tab for
+--- everyone.
+---
+--- os.clock rather than API.Get_tick deliberately: this is display pacing, not
+--- game logic, and it should not speed up or slow down with the tick.
+--- @return table|nil
+local function trackingSnapshot()
+    if not (CONFIG.debug and CONFIG.debug.mechanics) then return nil end
+
+    local now = os.clock()
+    if trackingCache and (now - trackingCacheAt) < TRACKING_INTERVAL then
+        return trackingCache
+    end
+
+    trackingCacheAt = now
+    trackingCache = mechanics:tracking()
+    return trackingCache
+end
+
 --- Builds the live data the GUI renders each frame.
 --- @return table
 local function buildGUIData()
@@ -4040,8 +4244,18 @@ local function buildGUIData()
         },
         review = mechanics:reviewSnapshot(),
 
-        mechanics = mechanics:tracking(),
-        loot = buildLootSnapshot()
+        mechanics = trackingSnapshot(),
+        loot = buildLootSnapshot(),
+
+        profile = profileSnapshot(),
+
+        -- Cheap enough to send every frame: four numbers, no game reads.
+        loopHealth = {
+            itersLastTick = loopHealth.itersLastTick,
+            lastJump = loopHealth.lastJump,
+            worstJump = loopHealth.worstJump,
+            skippedTicks = loopHealth.skippedTicks
+        }
     }
 end
 
@@ -4083,9 +4297,26 @@ Utils:log(string.format("Starting Raksha v%s", CONFIG.scriptVersion))
 -- # MAIN LOOP
 ------------------------------------------
 
--- Swap the settings window for the runtime window
-DrawImGui(function() if GUI.open then GUI.draw(buildGUIData()) end end)
+-- Swap the settings window for the runtime window.
+--
+-- buildGUIData is pcall'd because it runs INSIDE the render callback, before
+-- GUI.draw is entered — so it sits outside the safeDraw protection the GUI has
+-- around its own tabs (raksha/gui.lua:1127). A bad read there would escape into
+-- ImGui mid-frame, skip the endTab/endTabBar calls and leave the window broken
+-- until restart, which is the exact failure safeDraw exists to prevent. A failed
+-- build draws an empty frame and we try again next one.
+DrawImGui(function()
+    if not GUI.open then return end
+    local ok, data = pcall(buildGUIData)
+    GUI.draw(ok and data or {})
+end)
 GUI.selectInfoTab = true
+
+-- Last value SetDrawLogs was given, so we only push it when it changes.
+--
+-- It was going to the client on every loop iteration — 12-20 times a game
+-- tick — for a value that only changes when the user ticks a checkbox.
+local lastDrawLogs = nil
 
 while API.Read_LoopyLoop() do
     if GUI.isStopped() then
@@ -4095,11 +4326,24 @@ while API.Read_LoopyLoop() do
 
     -- Pause halts the script logic but keeps the GUI responsive
     if not GUI.isPaused() then
+        local t = os.clock()
+
         -- Timer tasks run before the player manager, matching Rasial's ordering
         timer:run()
+        t = profMark("timer:run", t)
+
         playerManager:update()
-        API.SetDrawLogs(CONFIG.debug.main)
+        profMark("playerManager", t)
+
+        if CONFIG.debug.main ~= lastDrawLogs then
+            lastDrawLogs = CONFIG.debug.main
+            API.SetDrawLogs(lastDrawLogs)
+        end
     end
 
+    noteLoopIteration()
+
+    local tSleep = os.clock()
     API.RandomSleep2(30, 10, 10)
+    profMark("RandomSleep2", tSleep)
 end

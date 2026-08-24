@@ -843,7 +843,58 @@ local function drawInfoTab(data)
     if ui:beginInfoTable("##rakshainfo", 0.45) then
         ui:tableRow("Location", data.location or "Unknown")
         ui:tableRow("Runtime", API.ScriptRuntimeString())
+
+        -- Loop health. "Are we keeping up with the game?" as a number.
+        --
+        -- Passes/tick should sit in the low teens. `skipped` counts game ticks
+        -- the main loop never got a pass in at all — on those the boss could
+        -- start AND finish an animation without us ever reading it, which is
+        -- exactly how mechanics and rotation steps end up late. Anything other
+        -- than 0 here is the thing to chase; a rising number means the loop is
+        -- being starved, not that a handler is mistuned.
+        local health = data.loopHealth
+        if health then
+            local skipped = whole(health.skippedTicks)
+            ui:tableRow("Loop passes / tick", tostring(whole(health.itersLastTick)),
+                        skipped > 0 and DANGER_COLOR or nil)
+            ui:tableRow("Ticks skipped", string.format("%d (worst jump %d)",
+                                                       skipped,
+                                                       whole(health.worstJump)),
+                        skipped > 0 and DANGER_COLOR or nil)
+        end
         ui:endColumns()
+    end
+
+    ----------------------------------------------------------------
+    -- Pass profile
+    ----------------------------------------------------------------
+    -- Only shown while the loop is actually behind. When passes/tick is healthy
+    -- this is noise, and the dashboard is already dense.
+    --
+    -- Sorted worst-first by main.lua. "worst" is the column to read: the bug we
+    -- are chasing is a section that is normally instant and occasionally blocks
+    -- for most of a game tick, which an average would hide completely.
+    local prof = data.profile
+    if prof and #prof > 0 and data.loopHealth and
+        whole(data.loopHealth.skippedTicks) > 0 then
+        ui:separator()
+        ui:sectionHeader("Pass profile (ms)", "Worst offender first.")
+
+        if ui:beginInfoTable("##rakshaprof", 0.45) then
+            -- Ten rows now, not six: Mechanics:update is broken into its own
+            -- sections (mech:*), so the table is longer and the interesting
+            -- entry is no longer guaranteed to be in the top few.
+            for index, row in ipairs(prof) do
+                if index > 10 then break end
+                ui:tableRow(tostring(row.name),
+                            string.format("%.1f last / %.1f worst",
+                                          tonumber(row.last) or 0,
+                                          tonumber(row.worst) or 0),
+                            (tonumber(row.worst) or 0) >= 100 and DANGER_COLOR or
+                                nil)
+            end
+            ui:endColumns()
+        end
     end
 
     ----------------------------------------------------------------

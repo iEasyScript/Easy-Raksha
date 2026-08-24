@@ -17,6 +17,7 @@ local API       = require("api")
 local Utils     = require("core.helper")
 local Player    = require("core.player")
 local Constants = require("raksha.constants")
+local Profiler  = require("core.profiler")
 
 local Mechanics = {}
 Mechanics.__index = Mechanics
@@ -353,14 +354,57 @@ local POOL_SURGE_REPEAT_TICKS = 5
 -- orbs each take a click inside ~360ms — comfortably under a single game tick.
 local EXPEL_INTERVAL_MS = 90
 
+--- Per-GAME-TICK memo for findAnyType, keyed by id and range. See findAnyType.
+local anyTypeCache, anyTypeCacheTick = {}, -1
+
 --- Finds all instances of an id across every common object type — robust to the
 --- exact `type` in constants being wrong, which is the usual reason a presence
 --- mechanic "never fires".
+---
+--- MEMOISED PER GAME TICK, keyed by id and range. This is the most expensive
+--- call in the file: it asks for EIGHT object types at once (FIND_TYPES), three
+--- of its callers at range 60. It is reached from handleInstakill,
+--- getLethalHazardTiles, liveManifestation and handleAdds — all of which run
+--- inside Mechanics:update(), which the `parallel`, `cooldown = 0` "Handle
+--- fight" task calls 12-20 times per tick. Several of those paths ask for the
+--- same id more than once in a single pass.
+---
+--- Objects only move on tick boundaries, so every repeat within a tick was
+--- returning identical data at full native cost. Behaviour is unchanged; only
+--- the number of scans is.
+---
+--- The array is shared, not copied — every call site iterates it or takes its
+--- length and none of them mutate it (checked across the file). getShadowTiles
+--- and getLethalHazardTiles are deliberately NOT cached for exactly that reason:
+--- they hand back tables their callers APPEND to (see getAllHazardTiles), so a
+--- shared table would grow without bound within a tick.
+---
+--- `fresh` forces a real scan and refreshes the entry. Exactly ONE caller needs
+--- it — handleAdds. Every other mechanic here keys off state the game only
+--- changes on a tick boundary, but Mind Flay orbs dispel ON CLICK, and the expel
+--- round-robin deliberately fires every EXPEL_INTERVAL_MS (~6 times a tick). A
+--- list frozen for the whole tick would keep reporting popped orbs, which delays
+--- the "cleared — reattacking Raksha" branch by up to a tick.
 --- @param id number
 --- @param range number
+--- @param fresh? boolean bypass the per-tick memo
 --- @return AllObject[]
-function Mechanics:findAnyType(id, range)
-    return API.GetAllObjArray1({id}, range or 30, FIND_TYPES) or {}
+function Mechanics:findAnyType(id, range, fresh)
+    local tick = API.Get_tick()
+    if tick ~= anyTypeCacheTick then
+        anyTypeCacheTick = tick
+        anyTypeCache = {}
+    end
+
+    local key = id .. ":" .. (range or 30)
+    if not fresh then
+        local hit = anyTypeCache[key]
+        if hit then return hit end
+    end
+
+    local result = API.GetAllObjArray1({id}, range or 30, FIND_TYPES) or {}
+    anyTypeCache[key] = result
+    return result
 end
 
 --- Builds an axis-aligned hazard box centred on a tile.
@@ -415,6 +459,23 @@ local SHADOW_LINGER_TICKS = 3
 --- cache stops a detection flicker from making us dart back and forth. Entries
 --- are dropped once they've gone unseen for SHADOW_LINGER_TICKS, which is what
 --- lets us walk back over ground where a shadow has genuinely despawned.
+--- Per-GAME-TICK memo for the shadow-floor scan. See getShadowTiles.
+local shadowScanCache, shadowScanCacheTick = nil, -1
+
+--- The raw floor-shadow object read, once per game tick.
+--- @param sf table Constants.SHADOW_FLOOR
+--- @return AllObject[]
+local function shadowScan(sf)
+    local tick = API.Get_tick()
+    if shadowScanCache and tick == shadowScanCacheTick then
+        return shadowScanCache
+    end
+
+    shadowScanCacheTick = tick
+    shadowScanCache = API.GetAllObjArray1(sf.ids, 30, {sf.type}) or {}
+    return shadowScanCache
+end
+
 --- @return table[]
 function Mechanics:getShadowTiles()
     local sf = Constants.SHADOW_FLOOR
@@ -427,7 +488,13 @@ function Mechanics:getShadowTiles()
     -- instead of attacking.
     local clearance = math.min(escapeClearance(sf.safeRange, sf.triggerRange), 3)
 
-    for _, s in ipairs(API.GetAllObjArray1(sf.ids, 30, {sf.type}) or {}) do
+    -- Only the NATIVE READ is memoised, not the table this returns. getShadowTiles
+    -- is reached several times per pass (getLethalHazardTiles, getAllHazardTiles,
+    -- ensureClearOfSweep and the debug readout all call it) and each one was a
+    -- fresh scan. Its OUTPUT still has to be a new table every call, because
+    -- getLethalHazardTiles appends to what it gets back — which is exactly why
+    -- this function is not memoised as a whole.
+    for _, s in ipairs(shadowScan(sf) or {}) do
         local tile = s.Tile_XYZ
         if tile then
             local x, y = math.floor(tile.x), math.floor(tile.y)
@@ -1676,17 +1743,43 @@ end
 -- # BOSS READING
 ------------------------------------------
 
+--- Per-GAME-TICK memo for the boss read. See getBoss.
+local bossCache, bossCacheTick = nil, -1
+
 --- Current boss state. Returns found=false when Raksha is not loaded.
+---
+--- MEMOISED PER GAME TICK, and that is a fix rather than an optimisation.
+--- Mechanics:update() calls this once and is itself driven by the "Handle fight"
+--- task, which is `parallel` with `cooldown = 0` — so it ran 12-20 NPC scans
+--- per tick for a value that cannot change between ticks. The game only moves
+--- entities on tick boundaries, so every one of those reads after the first
+--- returned identical data at full native cost.
+---
+--- The edge detection in update() is unaffected: `animChanged` compares against
+--- state.lastSeenAnim, which is written on every call, so the first call of a
+--- tick still sees the change and the rest still see none — exactly what an
+--- uncached scan produced, because the scan could not have changed within the
+--- tick either.
+---
+--- The table is shared, not copied. Nothing mutates a boss table (checked across
+--- both files), and the callers — update, runActive, ensureClearOfSweep — read
+--- fields only.
 --- @return table
 function Mechanics:getBoss()
+    local tick = API.Get_tick()
+    if bossCache and tick == bossCacheTick then return bossCache end
+
     local found = Utils:findAll(Constants.BOSS.id, Constants.BOSS.type, 50)
+    bossCacheTick = tick
     if #found == 0 then
-        return {found = false, anim = -1, life = -1, x = 0, y = 0, distance = -1}
+        bossCache = {found = false, anim = -1, life = -1, x = 0, y = 0,
+                     z = 0, distance = -1}
+        return bossCache
     end
 
     local boss = found[1]
     local tile = boss.Tile_XYZ
-    return {
+    bossCache = {
         found = true,
         anim = boss.Anim or -1,
         life = boss.Life or -1,
@@ -1695,6 +1788,7 @@ function Mechanics:getBoss()
         z = tile and tile.z or 0,
         distance = boss.Distance or -1
     }
+    return bossCache
 end
 
 ------------------------------------------
@@ -2944,7 +3038,23 @@ end
 --- @return boolean consumed
 function Mechanics:handleAdds()
     local add = Constants.ADDS.SHADOW_ENERGY
-    local present = self:findAnyType(add.id, add.range)
+
+    -- Fresh ONLY while a clear is actually in progress.
+    --
+    -- The first version of this bypassed the per-tick memo unconditionally,
+    -- because orbs dispel on click rather than on a tick boundary and the
+    -- round-robin below fires every EXPEL_INTERVAL_MS. That reasoning holds
+    -- while we are expelling — but it also meant an eight-object-type scan on
+    -- EVERY pass of the loop for the whole fight, and profiling put
+    -- Mechanics:update at the top of the cost table once the player-stat reads
+    -- were dealt with. Adds are up for a few seconds of a multi-minute kill, so
+    -- the bypass was paying its price ~99% of the time for no benefit.
+    --
+    -- Detection is not delayed by the cached path: the memo refreshes once per
+    -- game tick, so orbs are still seen on the tick they spawn, which is as
+    -- fresh as any other mechanic here. Only the CLEAR needs sub-tick reads, and
+    -- addsActive is exactly "a clear is in progress".
+    local present = self:findAnyType(add.id, add.range, self.state.addsActive)
 
     if #present > 0 then
         if not self.state.addsActive then
@@ -3038,10 +3148,13 @@ end
 --- relative `priority` decides which wins if a new animation starts while
 --- another response is still running.
 function Mechanics:update()
+    local tProf = os.clock()
+
     -- Read the boss once up front and refresh the arena anchor BEFORE anything
     -- moves us. Every movement decision is constrained to a radius around this,
     -- which is what keeps the fight near the middle of the arena.
     local boss = self:getBoss()
+    tProf = Profiler.mark("mech:getBoss", tProf)
 
     -- Track Raksha's tile first: phase 4 home is derived from it.
     if boss.found then
@@ -3057,6 +3170,7 @@ function Mechanics:update()
     elseif boss.found then
         self.state.arenaCenter = {x = boss.x, y = boss.y}
     end
+    tProf = Profiler.mark("mech:getHome", tProf)
 
     if boss.found then
         self.state.bossLife = boss.life
@@ -3132,6 +3246,7 @@ function Mechanics:update()
     elseif self.state.activeDef then
         self:finish()
     end
+    tProf = Profiler.mark("mech:register", tProf)
 
     -- 0. ALWAYS dodge the lethal ground (floor shadows + 2789 highlight). This
     --    is instant death, so it outranks everything including Expel.
@@ -3139,16 +3254,28 @@ function Mechanics:update()
     --    It reports whether it spent the tick's ACTION, not whether it moved.
     --    Walking costs no global cooldown, so a dodge that only walks lets the
     --    rotation keep firing — see the movement lock in handleInstakill.
-    if self:handleInstakill() then return true end
+    if self:handleInstakill() then
+        Profiler.mark("mech:instakill", tProf)
+        return true
+    end
+    tProf = Profiler.mark("mech:instakill", tProf)
 
     -- 0b. Tail sweep safety net. Below the lethal ground, which is instant
     --     death, but above everything else — a sweep that nothing registered a
     --     response for still has to be walked out of. See ensureClearOfSweep for
     --     why phase 4's dome made that a routine occurrence.
-    if self:ensureClearOfSweep(boss) then return true end
+    if self:ensureClearOfSweep(boss) then
+        Profiler.mark("mech:sweep", tProf)
+        return true
+    end
+    tProf = Profiler.mark("mech:sweep", tProf)
 
     -- 1. Expel Shadow Energy — top of the actioned priorities.
-    if self:handleAdds() then return true end
+    if self:handleAdds() then
+        Profiler.mark("mech:adds", tProf)
+        return true
+    end
+    tProf = Profiler.mark("mech:adds", tProf)
 
     -- 2-4. Boss animation responses: Freedom (bind/bombardment), bomb dodge,
     --      tail sweep. These beat the manifestation and the pools, so a boss
@@ -3166,8 +3293,12 @@ function Mechanics:update()
         exclusive = (self.state.activeDef ~= nil) and
                         (self.state.activeDef.exclusive == true)
 
-        if consumed then return true end
+        if consumed then
+            Profiler.mark("mech:runActive", tProf)
+            return true
+        end
     end
+    tProf = Profiler.mark("mech:runActive", tProf)
 
     -- 5-6. Anima pools, THEN the manifestation — unless an exclusive response is
     --      still mid-flight, or the lethal-ground dodge owns our movement.
@@ -3191,8 +3322,17 @@ function Mechanics:update()
     --      for control of where we stand — which is how you die to the thing you
     --      were already running from.
     if not exclusive and not self.state.instakillActive then
-        if self:handleAnimaPools() then return true end
-        if self:handleShadowManifestation() then return true end
+        if self:handleAnimaPools() then
+            Profiler.mark("mech:pools", tProf)
+            return true
+        end
+        tProf = Profiler.mark("mech:pools", tProf)
+
+        if self:handleShadowManifestation() then
+            Profiler.mark("mech:manifest", tProf)
+            return true
+        end
+        tProf = Profiler.mark("mech:manifest", tProf)
     end
 
     -- 7. Nothing threatening: drift back to our home tile so the next mechanic
@@ -3204,6 +3344,7 @@ function Mechanics:update()
     --    a large part of why phase 4 looked so frantic.
     if not exclusive and not self.state.activeDef and
         not self.state.instakillActive then self:returnHome() end
+    Profiler.mark("mech:returnHome", tProf)
     return false
 end
 
